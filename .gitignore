@@ -1,0 +1,39 @@
+=============================================================================
+Python Virtual Environments
+Ignore virtual environment folders to avoid committing project-specific
+dependencies and binaries. Add your virtual environment's name here.
+=============================================================================
+myenv/
+venv/
+.venv/
+
+=============================================================================
+Build & Compilation Artifacts
+Ignore build directories and compiled files created by setuptools/Cython.
+This keeps the repository clean of machine-specific binaries.
+=============================================================================
+build/
+*.pyd
+*.so
+
+=============================================================================
+Environment & Configuration Files
+Ignore files containing sensitive data like API keys or local configs.
+These should never be committed to version control.
+=============================================================================
+.env
+
+=============================================================================
+Python Caching
+Ignore Python's bytecode cache directory.
+=============================================================================
+pycache/
+*.pyc
+
+=============================================================================
+IDE & Editor Directories
+Ignore configuration folders created by common code editors.
+=============================================================================
+.vscode/
+.idea/
+*.txt
