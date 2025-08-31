@@ -1,0 +1,41 @@
+# reports.py
+import pandas as pd
+import quantstats as qs
+from core.utils import logger
+
+def print_performance_summary(returns: pd.Series):
+    """Prints a summary of key performance metrics to the console."""
+    logger.info("--- Performance Summary ---")
+    logger.info(f"Sharpe Ratio: {qs.stats.sharpe(returns):.2f}")
+    logger.info(f"Sortino Ratio: {qs.stats.sortino(returns):.2f}")
+    logger.info(f"Max Drawdown: {qs.stats.max_drawdown(returns):.2%}")
+    logger.info(f"CAGR (Compounded Annual Growth Rate): {qs.stats.cagr(returns):.2%}")
+    logger.info(f"Total Return: {qs.stats.comp(returns).iloc[-1]:.2%}")
+    logger.info("---------------------------")
+
+def generate_html_report(returns: pd.Series, trades_filepath: str, run_name: str):
+    """
+    Generates a full, professional-grade HTML report using quantstats.
+    
+    Args:
+        returns (pd.Series): A pandas Series of portfolio returns.
+        trades_filepath (str): Path to the CSV file containing the trade log.
+        run_name (str): The name of the backtest run, used for the output file.
+    """
+    try:
+        output_filename = f"report_{run_name}.html"
+        
+        # Load trades for transaction analysis
+        trades_df = pd.read_csv(trades_filepath, index_col=0, parse_dates=True)
+
+        qs.reports.html(
+            returns=returns,
+            benchmark=None,  # You can add a benchmark like '^NSEI' for Nifty 50
+            title=f"{run_name} - Performance Report",
+            output=output_filename,
+            trades=trades_df
+        )
+        logger.info(f"✅ Professional HTML performance report saved to '{output_filename}'")
+        logger.info("Open this file in your browser to view detailed charts and analytics.")
+    except Exception as e:
+        logger.error(f"Could not generate HTML report: {e}")

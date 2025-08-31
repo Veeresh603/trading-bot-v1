@@ -37,3 +37,4 @@ Ignore configuration folders created by common code editors.
 .vscode/
 .idea/
 *.txt
+*.log
