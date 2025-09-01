@@ -5,23 +5,23 @@ import talib
 import numpy as np
 from sklearn.preprocessing import StandardScaler
 from .utils import logger
-from config import Config, BacktestConfig
+from config import Config
 import traceback
 import os
-import requests
+from datetime import datetime, timedelta
 
 try:
-    from kiteconnect import KiteConnect
+    from kiteconnect import KiteConnect, exceptions
     KITE_AVAILABLE = True
 except ImportError:
     KITE_AVAILABLE = False
-    logger.warning("KiteConnect library not found. Will use yfinance as fallback.")
+    logger.warning("KiteConnect library not found. Yahoo Finance will be the only data source.")
 
 
 class HistoricalDataHandler:
     """
     Handles fetching, processing, and storing historical market data.
-    It now prioritizes loading from local cache, then Zerodha Kite, then yfinance.
+    It prioritizes Zerodha Kite and uses yfinance as a fallback.
     """
     def __init__(self, symbols, start_date, end_date, timeframe):
         self.symbols = symbols
@@ -37,23 +37,82 @@ class HistoricalDataHandler:
     def _setup_kite_client(self):
         """Initializes the KiteConnect client if credentials are provided."""
         if KITE_AVAILABLE and Config.KITE_API_KEY and Config.KITE_ACCESS_TOKEN:
-            self.kite = KiteConnect(api_key=Config.KITE_API_KEY)
-            self.kite.set_access_token(Config.KITE_ACCESS_TOKEN)
-            logger.info("✅ KiteConnect client initialized for historical data.")
+            try:
+                self.kite = KiteConnect(api_key=Config.KITE_API_KEY)
+                self.kite.set_access_token(Config.KITE_ACCESS_TOKEN)
+                logger.info("✅ KiteConnect client initialized for historical data.")
+            except Exception as e:
+                logger.error(f"Failed to initialize Kite client: {e}")
+                self.kite = None
         else:
-            logger.warning("KiteConnect credentials not fully configured. Will rely on yfinance.")
+            logger.warning("KiteConnect credentials not configured. Will rely solely on yfinance.")
+
+    def _get_instrument_token(self, symbol):
+        """Gets the instrument token for a given symbol from the NSE segment."""
+        try:
+            instruments = self.kite.instruments("NSE")
+            df = pd.DataFrame(instruments)
+            token_row = df[df['tradingsymbol'] == symbol]
+            if not token_row.empty:
+                return token_row.iloc[0]['instrument_token']
+        except Exception as e:
+            logger.error(f"Failed to get instrument token for {symbol}: {e}")
+        return None
 
     def _fetch_data_kite(self, symbol):
-        """Fetches historical data for a symbol using KiteConnect."""
-        try:
-            # Note: KiteConnect requires instrument tokens. This part would need to be
-            # implemented once you have the mapping from symbols to tokens.
-            # For now, this is a placeholder.
-            # For a production bot, you'd fetch the instrument token dynamically.
-            logger.warning("Kite historical data fetch is not yet implemented with instrument tokens. Falling back to yfinance.")
+        """Fetches historical data for a symbol using KiteConnect in chunks."""
+        token = self._get_instrument_token(symbol)
+        if not token:
+            logger.warning(f"Could not find instrument token for {symbol}. Cannot fetch from Kite.")
             return None
+        
+        try:
+            logger.info(f"Fetching historical data for {symbol} (Token: {token}) from Kite...")
+            start = datetime.strptime(self.start_date, '%Y-%m-%d').date()
+            end = datetime.strptime(self.end_date, '%Y-%m-%d').date()
+            
+            chunk_size = timedelta(days=199)
+            all_chunks = []
+            current_start = start
+
+            while current_start <= end:
+                current_end = min(current_start + chunk_size, end)
+                logger.info(f"  Fetching chunk from {current_start} to {current_end}")
+                chunk = self.kite.historical_data(token, current_start, current_end, self.timeframe)
+                all_chunks.extend(chunk)
+                current_start += chunk_size + timedelta(days=1)
+            
+            if not all_chunks:
+                return None
+
+            df = pd.DataFrame(all_chunks)
+            df["date"] = pd.to_datetime(df["date"])
+            df = df.set_index("date").sort_index()
+            df = df[~df.index.duplicated(keep='first')]
+            df.columns = [col.lower() for col in df.columns]
+            return df
+
         except Exception as e:
             logger.error(f"Failed to fetch data from Kite for {symbol}: {e}")
+            return None
+
+    def _fetch_data_yfinance(self, symbol):
+        """Fetches historical data using yfinance as a fallback."""
+        logger.info(f"Fetching historical data for {symbol} using yfinance as fallback...")
+        try:
+            yf_symbol = '^NSEI' if symbol == 'NIFTY 50' else symbol
+            yf_interval = self.timeframe.replace('minute', 'm')
+
+            df = yf.download(yf_symbol, start=self.start_date, end=self.end_date, interval=yf_interval, progress=False, auto_adjust=True)
+            
+            if df.empty:
+                logger.warning(f"No data returned for {symbol} ({yf_symbol}) from yfinance.")
+                return None
+            
+            df.columns = [col.lower() for col in df.columns]
+            return df
+        except Exception as e:
+            logger.error(f"Failed to fetch data from yfinance for {symbol}: {e}")
             return None
 
     def _fetch_and_prepare_data(self):
@@ -62,88 +121,69 @@ class HistoricalDataHandler:
         os.makedirs(Config.LOCAL_DATA_DIR, exist_ok=True)
 
         for symbol in self.symbols:
-            filepath = os.path.join(Config.LOCAL_DATA_DIR, f"{symbol}_{self.timeframe}.csv")
+            filename_symbol = symbol.replace(' ', '').replace(':', '')
+            filepath = os.path.join(Config.LOCAL_DATA_DIR, f"{filename_symbol}_{self.timeframe}.csv")
             df = pd.DataFrame()
 
-            # 1. Try to load from local cache
             if os.path.exists(filepath):
-                logger.info(f"Loading historical data for {symbol} from local file...")
+                logger.info(f"Loading data for {symbol} from local file: {filepath}")
                 try:
                     df = pd.read_csv(filepath, index_col=0, parse_dates=True)
-                    df = df.loc[self.start_date:self.end_date]
-                except Exception as e:
-                    logger.error(f"Failed to load local data for {symbol}: {e}")
+                except Exception:
                     df = pd.DataFrame()
-
-            # 2. If not in cache, fetch from Kite (if configured) or yfinance
+            
             if df.empty:
-                logger.info(f"Fetching historical data for {symbol} from yfinance as fallback...")
-                try:
-                    df = yf.download(symbol, start=self.start_date, end=self.end_date, interval=self.timeframe, progress=False)
-                    if df.empty:
-                        logger.warning(f"No data returned for {symbol} for the given period.")
-                        continue
-                    
-                    if isinstance(df.columns, pd.MultiIndex):
-                        df.columns = df.columns.droplevel(1)
+                if self.kite:
+                    df = self._fetch_data_kite(symbol)
+                
+                if df is None or df.empty:
+                    df = self._fetch_data_yfinance(symbol)
 
-                    df.columns = [col.lower() for col in df.columns]
-
-                    # Save newly fetched data to a local file for future use
-                    logger.info(f"Saving historical data for {symbol} to '{filepath}'...")
-                    df.to_csv(filepath)
-                except Exception as e:
-                    logger.error(f"Failed to process data for {symbol}: {e}")
-                    traceback.print_exc()
+                if df is None or df.empty:
+                    logger.error(f"Failed to fetch data for {symbol} from all sources.")
                     continue
+                
+                logger.info(f"Saving fetched data for {symbol} to '{filepath}'...")
+                df.to_csv(filepath)
+
+            df = df.loc[self.start_date:self.end_date]
+            if df.empty:
+                logger.warning(f"No data for {symbol} within the specified date range.")
+                continue
 
             logger.info(f"Calculating features for {symbol}...")
             features = self._calculate_features(df)
-            
             combined_df = pd.concat([df, features], axis=1)
+            
             combined_df.dropna(inplace=True)
             
-            feature_cols = [col for col in features.columns if col in combined_df.columns]
-            if not feature_cols:
-                logger.warning(f"No valid features generated for {symbol}. Skipping.")
+            if combined_df.empty:
+                logger.warning(f"DataFrame for {symbol} is empty after feature calculation. Skipping.")
                 continue
-
+            
+            feature_cols = [col for col in features.columns if col in combined_df.columns]
             all_feature_dfs.append(combined_df[feature_cols])
             self.symbol_data[symbol] = combined_df
 
         if not all_feature_dfs:
-            logger.error("No data could be fetched or processed for any symbol. Exiting.")
+            logger.error("No data could be processed for any symbol.")
             return
 
         logger.info("Fitting scaler on all available historical data...")
         full_feature_set = pd.concat(all_feature_dfs)
         feature_cols_to_scale = [col for col in full_feature_set.columns if col not in ['open', 'high', 'low', 'close', 'adj close', 'volume']]
         
-        if not feature_cols_to_scale:
-             logger.warning("No feature columns found to scale. Skipping scaling.")
-             return
-        
-        full_feature_set.replace([np.inf, -np.inf], np.nan, inplace=True)
-        full_feature_set.dropna(subset=feature_cols_to_scale, inplace=True)
+        if feature_cols_to_scale:
+            self.scaler.fit(full_feature_set[feature_cols_to_scale])
 
-        self.scaler.fit(full_feature_set[feature_cols_to_scale])
+            for symbol, data in self.symbol_data.items():
+                scalable_cols = [col for col in feature_cols_to_scale if col in data.columns]
+                if scalable_cols:
+                    data.loc[:, scalable_cols] = self.scaler.transform(data[scalable_cols])
+                    self.symbol_data[symbol] = data
 
-        logger.info("Applying scaler to each symbol's data...")
-        for symbol, data in self.symbol_data.items():
-            feature_cols = [col for col in feature_cols_to_scale if col in data.columns]
-            if feature_cols:
-                data.replace([np.inf, -np.inf], np.nan, inplace=True)
-                data.dropna(subset=feature_cols, inplace=True)
-                if data.empty:
-                    logger.warning(f"Data for {symbol} became empty after cleaning inf/nan. Skipping scaling.")
-                    del self.symbol_data[symbol]
-                    continue
-                
-                data[feature_cols] = self.scaler.transform(data[feature_cols])
-                self.symbol_data[symbol] = data
-
-    def _calculate_features(self, df):
-        """Calculates all technical indicators and features."""
+    def _calculate_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Calculates a comprehensive set of technical indicators and features."""
         features = pd.DataFrame(index=df.index)
         
         open_p = df['open'].values.astype('float64')
@@ -152,85 +192,55 @@ class HistoricalDataHandler:
         low = df['low'].values.astype('float64')
         volume = df['volume'].values.astype('float64')
 
+        # Momentum Indicators
         features['RSI'] = talib.RSI(close)
         features['MACD'], features['MACD_signal'], features['MACD_hist'] = talib.MACD(close)
         features['ADX'] = talib.ADX(high, low, close)
         features['CCI'] = talib.CCI(high, low, close)
-        
-        features['ATR'] = talib.ATR(high, low, close)
-        features['BB_upper'], features['BB_middle'], features['BB_lower'] = talib.BBANDS(close)
-        
-        features['OBV'] = talib.OBV(close, volume)
-        
-        features['SMA_20'] = talib.SMA(close, timeperiod=20)
-        features['SMA_50'] = talib.SMA(close, timeperiod=50)
-        features['EMA_20'] = talib.EMA(close, timeperiod=20)
-        features['EMA_50'] = talib.EMA(close, timeperiod=50)
-
-        features['price_change_1d'] = df['close'].pct_change(1)
-        features['price_change_5d'] = df['close'].pct_change(5)
-        features['day_of_week'] = df.index.dayofweek
-        features['month_of_year'] = df.index.month
-
         features['MOM'] = talib.MOM(close)
         features['STOCH_k'], features['STOCH_d'] = talib.STOCH(high, low, close)
         features['WILLR'] = talib.WILLR(high, low, close)
-        features['TSF'] = talib.TSF(close)
         features['TRIX'] = talib.TRIX(close)
+
+        # Volatility Indicators
+        features['ATR'] = talib.ATR(high, low, close)
+        features['BB_upper'], features['BB_middle'], features['BB_lower'] = talib.BBANDS(close)
         
+        # Volume Indicator
+        features['OBV'] = talib.OBV(close, volume)
+        
+        # Trend Indicators
+        features['SMA_20'] = talib.SMA(close, timeperiod=20)
+        features['EMA_20'] = talib.EMA(close, timeperiod=20)
+        features['SMA_50'] = talib.SMA(close, timeperiod=50)
+        features['EMA_50'] = talib.EMA(close, timeperiod=50)
+
+        # Price & Volume Change Features
+        features['price_change_1d'] = df['close'].pct_change(1)
+        features['volume_change_1d'] = df['volume'].pct_change(1)
+        
+        # Time-based Features
+        features['day_of_week'] = df.index.dayofweek
+        features['month_of_year'] = df.index.month
+
+        # Candlestick Pattern Recognition (Examples)
         features['CDL2CROWS'] = talib.CDL2CROWS(open_p, high, low, close)
         features['CDL3BLACKCROWS'] = talib.CDL3BLACKCROWS(open_p, high, low, close)
-
-        features['SMA_100'] = talib.SMA(close, timeperiod=100)
-        features['SMA_200'] = talib.SMA(close, timeperiod=200)
-        features['EMA_100'] = talib.EMA(close, timeperiod=100)
-        features['EMA_200'] = talib.EMA(close, timeperiod=200)
-        features['RSI_10'] = talib.RSI(close, timeperiod=10)
-        features['RSI_20'] = talib.RSI(close, timeperiod=20)
-        features['ATR_10'] = talib.ATR(high, low, close, timeperiod=10)
-        features['ATR_20'] = talib.ATR(high, low, close, timeperiod=20)
-        features['CCI_10'] = talib.CCI(high, low, close, timeperiod=10)
-        features['CCI_20'] = talib.CCI(high, low, close, timeperiod=20)
-        features['MACD_fast10_slow30'], _, _ = talib.MACD(close, fastperiod=10, slowperiod=30)
-        features['MACD_fast15_slow40'], _, _ = talib.MACD(close, fastperiod=15, slowperiod=40)
-        features['MOM_10'] = talib.MOM(close, timeperiod=10)
-        features['MOM_20'] = talib.MOM(close, timeperiod=20)
-        features['ADX_10'] = talib.ADX(high, low, close, timeperiod=10)
-        features['ADX_20'] = talib.ADX(high, low, close, timeperiod=20)
-        features['WILLR_10'] = talib.WILLR(high, low, close, timeperiod=10)
-        features['WILLR_20'] = talib.WILLR(high, low, close, timeperiod=20)
-        features['BB_upper_10'], _, features['BB_lower_10'] = talib.BBANDS(close, timeperiod=10)
-        features['BB_upper_30'], _, features['BB_lower_30'] = talib.BBANDS(close, timeperiod=30)
-        
-        ema_50_safe = features['EMA_50'].replace(0, 1e-9)
-        features['price_to_ema50_ratio'] = df['close'] / ema_50_safe
-        
-        features['volume_change_1d'] = df['volume'].pct_change(1)
-        features['volume_change_5d'] = df['volume'].pct_change(5)
         
         final_features = features.copy()
-        while len(final_features.columns) < 55:
+        final_features.replace([np.inf, -np.inf], np.nan, inplace=True)
+        final_features.dropna(axis=1, how='all', inplace=True)
+        final_features.fillna(0, inplace=True)
+
+        while len(final_features.columns) < Config.INPUT_SIZE:
             col_name = f'placeholder_{len(final_features.columns)}'
             final_features[col_name] = 0.0
 
-        if len(final_features.columns) > 55:
-            final_features = final_features.iloc[:, :55]
-
+        if len(final_features.columns) > Config.INPUT_SIZE:
+            final_features = final_features.iloc[:, :Config.INPUT_SIZE]
+            
         return final_features
 
-    def get_latest_bar(self, symbol):
-        if symbol in self.symbol_data:
-            return self.symbol_data[symbol].iloc[-1]
-        return None
-
-    def get_sequence(self, symbol, end_date):
-        if symbol in self.symbol_data:
-            data = self.symbol_data[symbol]
-            end_idx = data.index.get_loc(end_date)
-            start_idx = max(0, end_idx - Config.SEQUENCE_LENGTH + 1)
-            return data.iloc[start_idx:end_idx + 1]
-        return None
-    
     def get_atr(self, symbol, current_time):
         """Returns the ATR value for a given symbol at a specific time."""
         if symbol in self.symbol_data and current_time in self.symbol_data[symbol].index:

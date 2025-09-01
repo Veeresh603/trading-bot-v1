@@ -53,8 +53,9 @@ class BacktestConfig:
     """
     Configuration specific to the backtesting engine.
     """
-    START_DATE = "2025-01-01"
-    END_DATE = "2025-09-01"
+    # --- FIX: Extend the date range for more historical data ---
+    START_DATE = "2023-01-01"
+    END_DATE = "2024-01-01"
 
     INITIAL_CAPITAL = 100000.0
     COMMISSION_BPS = 2.0
@@ -87,9 +88,13 @@ def get_current_options_contracts(kite_client: KiteConnect):
         df_nse = pd.DataFrame(nse_instruments)
         df_nfo = pd.DataFrame(nfo_instruments)
         
+        # --- FIX: Standardize the column name to 'trading_symbol' ---
+        df_nse.rename(columns={'tradingsymbol': 'trading_symbol'}, inplace=True)
+        df_nfo.rename(columns={'tradingsymbol': 'trading_symbol'}, inplace=True)
+
         current_nifty_price = 0.0
         # Get the instrument token for the underlying symbol (NIFTY 50)
-        nifty_instrument_token = df_nse[df_nse['tradingsymbol'] == Config.UNDERLYING_SYMBOL].iloc[0]['instrument_token']
+        nifty_instrument_token = df_nse[df_nse['trading_symbol'] == Config.UNDERLYING_SYMBOL].iloc[0]['instrument_token']
 
         if is_market_open():
             # Market is open, try to get live LTP
@@ -107,9 +112,10 @@ def get_current_options_contracts(kite_client: KiteConnect):
             try:
                 # To get the latest closing price, we need to fetch the last day's data
                 today = datetime.now().date()
+                from_date = today - timedelta(days=5)
                 historical_data = kite_client.historical_data(
                     instrument_token=nifty_instrument_token,
-                    from_date=BacktestConfig.END_DATE,
+                    from_date=from_date,
                     to_date=today,
                     interval='day'
                 )

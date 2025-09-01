@@ -1,7 +1,9 @@
 # backtest.py
 import argparse
-from config import Config, BacktestConfig, get_current_options_contracts
-from core.options_data import OptionsDataHandler
+import sys
+from config import Config, BacktestConfig
+# --- FIX: Import the correct data handler for indices ---
+from core.data import HistoricalDataHandler
 from core.strategy import AIStrategy
 from core.portfolio import Portfolio
 from core.execution import BacktestExecutionHandler
@@ -11,32 +13,24 @@ import pandas as pd
 from datetime import datetime
 from kiteconnect import KiteConnect
 
-def run_backtest(strategy_name: str, contracts: list):
+def run_backtest(strategy_name: str, symbol: str):
     """
-    Main function to run the event-driven backtest for options.
+    Main function to run the event-driven backtest on the underlying asset (e.g., NIFTY 50).
     """
-    logger.info(f"--- Starting Backtest for {strategy_name} on {len(contracts)} contracts ---")
+    logger.info(f"--- Starting Backtest for {strategy_name} on {symbol} ---")
     logger.info(f"Period: {BacktestConfig.START_DATE} to {BacktestConfig.END_DATE} | Initial Capital: ${BacktestConfig.INITIAL_CAPITAL:,.2f}")
 
-    kite_client = KiteConnect(api_key=Config.KITE_API_KEY)
-    try:
-        kite_client.set_access_token(Config.KITE_ACCESS_TOKEN)
-    except Exception as e:
-        logger.error(f"Failed to set access token during backtest setup: {e}")
-        logger.error("Please run login_kite.py to get a new access token and update your .env file.")
-        return
-
-    data_handler = OptionsDataHandler(
-        kite_client=kite_client,
-        contracts=contracts,
+    # --- FIX: Use HistoricalDataHandler to fetch data for the underlying index ---
+    data_handler = HistoricalDataHandler(
+        symbols=[symbol],
         start_date=BacktestConfig.START_DATE,
         end_date=BacktestConfig.END_DATE,
         timeframe=Config.HISTORICAL_DATA_TIMEFRAME
     )
     
-    if not data_handler.data:
-        logger.error("No historical data could be fetched for any contract.")
-        telegram.send_message(f"❌ *Backtest Failed*\n\nNo historical data found.")
+    if not data_handler.symbol_data:
+        logger.error(f"No historical data could be fetched for {symbol}.")
+        telegram.send_message(f"❌ *Backtest Failed*\n\nNo historical data found for {symbol}.")
         return
 
     portfolio = Portfolio(
@@ -48,31 +42,30 @@ def run_backtest(strategy_name: str, contracts: list):
         slippage_bps=BacktestConfig.SLIPPAGE_BPS
     )
 
+    # --- FIX: Adapt strategy initialization for a single symbol ---
+    # The 'contracts' parameter is now a simple list with one symbol dict
+    strategy_contracts = [{'trading_symbol': symbol}]
     strategy = AIStrategy(
         data_handler=data_handler,
-        contracts=contracts,
+        contracts=strategy_contracts,
         sequence_length=Config.SEQUENCE_LENGTH
     )
 
-    all_dates = sorted(list(set(date for df in data_handler.data.values() for date in df.index)))
+    all_dates = sorted(data_handler.symbol_data[symbol].index)
     
-    logger.info(f"Backtesting over a total of {len(all_dates)} days.")
+    logger.info(f"Backtesting over a total of {len(all_dates)} market timestamps.")
 
     for bar_datetime in all_dates:
-        current_market_data = {
-            c['trading_symbol']: data_handler.data[c['trading_symbol']].loc[bar_datetime]
-            for c in contracts if c['trading_symbol'] in data_handler.data and bar_datetime in data_handler.data[c['trading_symbol']].index
-        }
+        # --- FIX: Generate signals and execute based on the single underlying symbol ---
+        current_bar = data_handler.symbol_data[symbol].loc[bar_datetime]
         
-        for contract in contracts:
-            symbol = contract['trading_symbol']
-            if symbol in current_market_data:
-                signal = strategy.generate_signals(contract, bar_datetime)
+        # The strategy expects a contract dictionary, so we provide one
+        signal = strategy.generate_signals(strategy_contracts[0], bar_datetime)
 
-                if signal and signal.get('direction') != 'HOLD':
-                    order = portfolio.create_order_from_signal(signal, current_market_data[symbol], data_handler)
-                    if order:
-                        execution_handler.execute_order(order, current_market_data[symbol], portfolio)
+        if signal and signal.get('direction') != 'HOLD':
+            order = portfolio.create_order_from_signal(signal, current_bar, data_handler)
+            if order:
+                execution_handler.execute_order(order, current_bar, portfolio)
                         
     logger.info("--- Backtest Complete. Generating Performance Report... ---")
 
@@ -85,14 +78,14 @@ def run_backtest(strategy_name: str, contracts: list):
     logger.info(f"Total Trades Executed: {total_trades}")
 
     trades_df = pd.DataFrame(portfolio.trades)
-    trades_filepath = f"trades_{strategy_name}_options.csv"
+    trades_filepath = f"trades_{strategy_name}_{symbol.replace(' ', '')}.csv"
     if not trades_df.empty:
         trades_df.to_csv(trades_filepath, index=False)
         returns = portfolio.equity_curve.pct_change().dropna()
         reports.generate_html_report(
             returns=returns,
             trades_filepath=trades_filepath,
-            run_name=f"{strategy_name}_options"
+            run_name=f"{strategy_name}_{symbol.replace(' ', '')}"
         )
     else:
         logger.warning("No trades executed during backtest. Skipping report generation.")
@@ -100,33 +93,21 @@ def run_backtest(strategy_name: str, contracts: list):
     summary_message = (
         f"✅ *Backtest Complete*\n\n"
         f"*Strategy:* `{strategy_name}`\n"
-        f"*Contracts:* `{', '.join(c['trading_symbol'] for c in contracts)}`\n"
+        f"*Symbol:* `{symbol}`\n"
         f"*Final Equity:* `${final_equity:,.2f}`\n"
         f"*Total Return:* `{total_return:.2f}%`\n"
         f"*Total Trades:* `{total_trades}`\n\n"
-        f"📈 Report saved to `report_{strategy_name}_options.html`"
+        f"📈 Report saved to `report_{strategy_name}_{symbol.replace(' ', '')}.html`"
     )
     telegram.send_message(summary_message)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Professional Event-Driven Options Backtester")
+    parser = argparse.ArgumentParser(description="Professional Event-Driven Backtester")
     parser.add_argument("--strategy", type=str, default="lstm", help="The strategy to backtest.")
+    parser.add_argument("--symbol", type=str, default=Config.UNDERLYING_SYMBOL, help="The symbol to backtest (e.g., 'NIFTY 50').")
     args = parser.parse_args()
-
-    kite_client = KiteConnect(api_key=Config.KITE_API_KEY)
-    try:
-        kite_client.set_access_token(Config.KITE_ACCESS_TOKEN)
-    except Exception as e:
-        logger.error(f"Failed to set access token during backtest setup: {e}")
-        logger.error("Please run login_kite.py to get a new access token and update your .env file.")
-        sys.exit(1)
         
-    contracts = get_current_options_contracts(kite_client)
-    if not contracts:
-        logger.error("Could not fetch contracts to backtest. Exiting.")
-        sys.exit(1)
-
     run_backtest(
         strategy_name=args.strategy,
-        contracts=contracts
+        symbol=args.symbol
     )
