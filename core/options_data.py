@@ -75,7 +75,7 @@ class OptionsDataHandler:
                     
                     df = pd.DataFrame(all_chunks)
                     if df.empty:
-                        logger.warning(f"No data returned for {symbol} for the given period.")
+                        logger.warning(f"No data returned for {symbol} for the given period. Skipping.")
                         continue
                     
                     df.set_index('date', inplace=True)
@@ -90,6 +90,21 @@ class OptionsDataHandler:
                 except Exception as e:
                     logger.error(f"An unexpected error occurred while fetching data for {symbol}: {e}")
                     continue
+            
+            # --- START OF FIX: Handle zero-price contracts and empty DataFrames ---
+            if df.empty:
+                logger.warning(f"Data for {symbol} is empty after fetching/loading. Skipping.")
+                continue
+
+            if df['close'].iloc[-1] == 0.0:
+                fallback_price = contract.get('strike')
+                if fallback_price and fallback_price != 0.0:
+                    logger.warning(f"Last close price for {symbol} is 0.0. Using strike price {fallback_price} as fallback.")
+                    df['close'].iloc[-1] = fallback_price
+                else:
+                    logger.warning(f"Could not find a valid fallback price for {symbol}. Skipping.")
+                    continue
+            # --- END OF FIX ---
 
             if not df.empty:
                 logger.info(f"Calculating features for {symbol}...")
@@ -171,6 +186,7 @@ class OptionsDataHandler:
         return None
     
     def get_atr(self, symbol, current_time):
+        """Returns the ATR value for a given symbol at a specific time."""
         if symbol in self.data and current_time in self.data[symbol].index:
             return self.data[symbol].loc[current_time, 'ATR']
         return None

@@ -53,8 +53,8 @@ class BacktestConfig:
     """
     Configuration specific to the backtesting engine.
     """
-    START_DATE = "2024-08-01"
-    END_DATE = "2025-08-01"
+    START_DATE = "2025-01-01"
+    END_DATE = "2025-09-01"
 
     INITIAL_CAPITAL = 100000.0
     COMMISSION_BPS = 2.0
@@ -65,6 +65,14 @@ class BacktestConfig:
     RISK_PER_TRADE_PCT = 0.01
     ATR_MULTIPLIER = 2.0
 
+def is_market_open():
+    """Checks if the Indian market is currently open (9:15 AM to 3:30 PM IST)."""
+    now = datetime.now()
+    market_open_time = now.replace(hour=9, minute=15, second=0, microsecond=0)
+    market_close_time = now.replace(hour=15, minute=30, second=0, microsecond=0)
+    
+    # Check if it's a weekday (Monday=0, Sunday=6) and within market hours
+    return 0 <= now.weekday() <= 4 and market_open_time <= now <= market_close_time
 
 def get_current_options_contracts(kite_client: KiteConnect):
     """
@@ -79,15 +87,46 @@ def get_current_options_contracts(kite_client: KiteConnect):
         df_nse = pd.DataFrame(nse_instruments)
         df_nfo = pd.DataFrame(nfo_instruments)
         
-        # Always fetch live NIFTY price via LTP
-        try:
-            ltp_data = kite_client.ltp(f"NSE:{Config.UNDERLYING_SYMBOL}")
-            current_nifty_price = ltp_data[f"NSE:{Config.UNDERLYING_SYMBOL}"]['last_price']
-            logger.info(f"Fetched last_price via LTP: {current_nifty_price}")
-        except Exception as e:
-            logger.error(f"Cannot fetch last_price for {Config.UNDERLYING_SYMBOL}: {e}")
-            return []
+        current_nifty_price = 0.0
+        # Get the instrument token for the underlying symbol (NIFTY 50)
+        nifty_instrument_token = df_nse[df_nse['tradingsymbol'] == Config.UNDERLYING_SYMBOL].iloc[0]['instrument_token']
 
+        if is_market_open():
+            # Market is open, try to get live LTP
+            try:
+                ltp_data = kite_client.ltp(f"NSE:{Config.UNDERLYING_SYMBOL}")
+                current_nifty_price = ltp_data.get(f"NSE:{Config.UNDERLYING_SYMBOL}", {}).get('last_price', 0.0)
+                logger.info(f"Market is OPEN. Fetched live NIFTY 50 LTP: {current_nifty_price}")
+            except Exception as e:
+                logger.error(f"Failed to fetch live LTP from Kite for {Config.UNDERLYING_SYMBOL}: {e}")
+                current_nifty_price = 0.0
+        
+        if current_nifty_price == 0.0:
+            # Market is closed or live LTP fetch failed, use historical data as fallback
+            logger.info("Market is CLOSED or live data fetch failed. Using historical data closing price.")
+            try:
+                # To get the latest closing price, we need to fetch the last day's data
+                today = datetime.now().date()
+                historical_data = kite_client.historical_data(
+                    instrument_token=nifty_instrument_token,
+                    from_date=BacktestConfig.END_DATE,
+                    to_date=today,
+                    interval='day'
+                )
+                if historical_data:
+                    current_nifty_price = historical_data[-1]['close']
+                    logger.info(f"Fetched historical closing price for NIFTY 50: {current_nifty_price}")
+                else:
+                    logger.error(f"Could not fetch historical closing price for NIFTY 50. Using fallback hardcoded price.")
+                    current_nifty_price = 22500.0 # A hardcoded fallback
+            except Exception as e:
+                logger.error(f"Failed to fetch historical data for {Config.UNDERLYING_SYMBOL}: {e}")
+                current_nifty_price = 22500.0 # A hardcoded fallback
+                
+        if current_nifty_price == 0.0:
+            logger.error("Cannot determine a valid NIFTY 50 price. Exiting contract search.")
+            return {}
+            
         # Filter NIFTY options from NFO list
         nifty_options = df_nfo[
             (df_nfo['name'] == 'NIFTY') &

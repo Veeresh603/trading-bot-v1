@@ -7,7 +7,9 @@ import pandas as pd
 from sklearn.model_selection import train_test_split
 import os
 import sys
+from datetime import datetime
 
+# FIX: Removed the incorrect import of 'Config' from 'config'
 from config import Config, BacktestConfig, get_current_options_contracts
 from core.model import LSTMBrain
 from core.options_data import OptionsDataHandler
@@ -62,25 +64,28 @@ def main():
         logger.error("Please run login_kite.py to get a new access token and update your .env file.")
         sys.exit(1)
 
-    # --- FIX: Dynamically fetch contracts and check if the list is empty ---
-    contracts = get_current_options_contracts(kite_client)
-    if not contracts:
-        logger.error("Could not fetch contracts to backtest. Exiting.")
+    contracts_dict = get_current_options_contracts(kite_client)
+    contracts_list = contracts_dict.get('all')
+    if not contracts_list:
+        logger.error("Could not fetch contracts to train. Exiting.")
         sys.exit(1)
 
     data_handler = OptionsDataHandler(
         kite_client=kite_client,
-        contracts=contracts,
+        contracts=contracts_list,
         start_date=BacktestConfig.START_DATE,
         end_date=BacktestConfig.END_DATE,
         timeframe=Config.HISTORICAL_DATA_TIMEFRAME
     )
 
     all_features, all_labels = [], []
-
-    # --- FIX: Iterate over the dynamically fetched contracts list ---
-    for contract in contracts:
-        symbol = contract['trading_symbol']
+    
+    for contract in contracts_list:
+        symbol = contract.get('trading_symbol')
+        if not symbol:
+             logger.warning(f"Skipping contract with missing trading symbol: {contract}")
+             continue
+        
         processed_data = data_handler.data.get(symbol)
         if processed_data is None or processed_data.empty:
             logger.warning(f"No data found for {symbol}, skipping training for this contract.")
@@ -115,6 +120,10 @@ def main():
 
     X_all, y_all = np.concatenate(all_features), np.concatenate(all_labels)
     logger.info(f"Total training sequences created: {len(X_all)}")
+    
+    if len(X_all) < 2:
+        logger.error("Not enough training samples to perform a train/validation split. Exiting.")
+        return
 
     X_train, X_val, y_train, y_val = train_test_split(X_all, y_all, test_size=0.2, random_state=42, stratify=y_all)
 
