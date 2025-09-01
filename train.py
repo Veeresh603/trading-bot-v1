@@ -8,10 +8,11 @@ from sklearn.model_selection import train_test_split
 import os
 import sys
 
-from config import Config, BacktestConfig
+from config import Config, BacktestConfig, get_current_options_contracts
 from core.model import LSTMBrain
-from core.data import HistoricalDataHandler
+from core.options_data import OptionsDataHandler
 from core.utils import logger
+from kiteconnect import KiteConnect
 
 def get_target_labels_triple_barrier(
     close_prices: pd.Series,
@@ -51,10 +52,25 @@ def create_sequences(input_data: pd.DataFrame, target_data: pd.Series, seq_lengt
     return np.array(xs), np.array(ys)
 
 def main():
-    logger.info("--- Starting AI Model Training ---")
+    logger.info("--- Starting Options AI Model Training ---")
 
-    data_handler = HistoricalDataHandler(
-        symbols=Config.SYMBOLS_TO_TRADE,
+    kite_client = KiteConnect(api_key=Config.KITE_API_KEY)
+    try:
+        kite_client.set_access_token(Config.KITE_ACCESS_TOKEN)
+    except Exception as e:
+        logger.error(f"Failed to set access token during training setup: {e}")
+        logger.error("Please run login_kite.py to get a new access token and update your .env file.")
+        sys.exit(1)
+
+    # --- FIX: Dynamically fetch contracts and check if the list is empty ---
+    contracts = get_current_options_contracts(kite_client)
+    if not contracts:
+        logger.error("Could not fetch contracts to backtest. Exiting.")
+        sys.exit(1)
+
+    data_handler = OptionsDataHandler(
+        kite_client=kite_client,
+        contracts=contracts,
         start_date=BacktestConfig.START_DATE,
         end_date=BacktestConfig.END_DATE,
         timeframe=Config.HISTORICAL_DATA_TIMEFRAME
@@ -62,10 +78,12 @@ def main():
 
     all_features, all_labels = [], []
 
-    for symbol in Config.SYMBOLS_TO_TRADE:
-        processed_data = data_handler.symbol_data.get(symbol)
+    # --- FIX: Iterate over the dynamically fetched contracts list ---
+    for contract in contracts:
+        symbol = contract['trading_symbol']
+        processed_data = data_handler.data.get(symbol)
         if processed_data is None or processed_data.empty:
-            logger.warning(f"No data found for {symbol}, skipping.")
+            logger.warning(f"No data found for {symbol}, skipping training for this contract.")
             continue
         
         logger.info(f"Processing data for {symbol}...")
@@ -90,7 +108,6 @@ def main():
             all_labels.append(y)
         else:
             logger.warning(f"Not enough valid sequences generated for {symbol}.")
-
 
     if not all_features:
         logger.error("No data available for training after processing. Exiting.")
@@ -144,7 +161,6 @@ def main():
     except Exception as e:
         logger.error(f"Could not compile model to TorchScript: {e}")
         sys.exit(1)
-
 
 if __name__ == "__main__":
     main()

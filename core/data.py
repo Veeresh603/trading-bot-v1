@@ -5,13 +5,23 @@ import talib
 import numpy as np
 from sklearn.preprocessing import StandardScaler
 from .utils import logger
-from config import Config
+from config import Config, BacktestConfig
 import traceback
+import os
+import requests
+
+try:
+    from kiteconnect import KiteConnect
+    KITE_AVAILABLE = True
+except ImportError:
+    KITE_AVAILABLE = False
+    logger.warning("KiteConnect library not found. Will use yfinance as fallback.")
+
 
 class HistoricalDataHandler:
     """
     Handles fetching, processing, and storing historical market data.
-    This includes calculating technical indicators and scaling features.
+    It now prioritizes loading from local cache, then Zerodha Kite, then yfinance.
     """
     def __init__(self, symbols, start_date, end_date, timeframe):
         self.symbols = symbols
@@ -20,42 +30,86 @@ class HistoricalDataHandler:
         self.timeframe = timeframe
         self.symbol_data = {}
         self.scaler = StandardScaler()
+        self.kite = None
+        self._setup_kite_client()
         self._fetch_and_prepare_data()
+
+    def _setup_kite_client(self):
+        """Initializes the KiteConnect client if credentials are provided."""
+        if KITE_AVAILABLE and Config.KITE_API_KEY and Config.KITE_ACCESS_TOKEN:
+            self.kite = KiteConnect(api_key=Config.KITE_API_KEY)
+            self.kite.set_access_token(Config.KITE_ACCESS_TOKEN)
+            logger.info("✅ KiteConnect client initialized for historical data.")
+        else:
+            logger.warning("KiteConnect credentials not fully configured. Will rely on yfinance.")
+
+    def _fetch_data_kite(self, symbol):
+        """Fetches historical data for a symbol using KiteConnect."""
+        try:
+            # Note: KiteConnect requires instrument tokens. This part would need to be
+            # implemented once you have the mapping from symbols to tokens.
+            # For now, this is a placeholder.
+            # For a production bot, you'd fetch the instrument token dynamically.
+            logger.warning("Kite historical data fetch is not yet implemented with instrument tokens. Falling back to yfinance.")
+            return None
+        except Exception as e:
+            logger.error(f"Failed to fetch data from Kite for {symbol}: {e}")
+            return None
 
     def _fetch_and_prepare_data(self):
         """Orchestrator to fetch, process, and scale data for all symbols."""
         all_feature_dfs = []
+        os.makedirs(Config.LOCAL_DATA_DIR, exist_ok=True)
 
         for symbol in self.symbols:
-            logger.info(f"Fetching historical data for {symbol}...")
-            try:
-                df = yf.download(symbol, start=self.start_date, end=self.end_date, interval=self.timeframe, progress=False)
-                if df.empty:
-                    logger.warning(f"No data returned for {symbol} for the given period.")
+            filepath = os.path.join(Config.LOCAL_DATA_DIR, f"{symbol}_{self.timeframe}.csv")
+            df = pd.DataFrame()
+
+            # 1. Try to load from local cache
+            if os.path.exists(filepath):
+                logger.info(f"Loading historical data for {symbol} from local file...")
+                try:
+                    df = pd.read_csv(filepath, index_col=0, parse_dates=True)
+                    df = df.loc[self.start_date:self.end_date]
+                except Exception as e:
+                    logger.error(f"Failed to load local data for {symbol}: {e}")
+                    df = pd.DataFrame()
+
+            # 2. If not in cache, fetch from Kite (if configured) or yfinance
+            if df.empty:
+                logger.info(f"Fetching historical data for {symbol} from yfinance as fallback...")
+                try:
+                    df = yf.download(symbol, start=self.start_date, end=self.end_date, interval=self.timeframe, progress=False)
+                    if df.empty:
+                        logger.warning(f"No data returned for {symbol} for the given period.")
+                        continue
+                    
+                    if isinstance(df.columns, pd.MultiIndex):
+                        df.columns = df.columns.droplevel(1)
+
+                    df.columns = [col.lower() for col in df.columns]
+
+                    # Save newly fetched data to a local file for future use
+                    logger.info(f"Saving historical data for {symbol} to '{filepath}'...")
+                    df.to_csv(filepath)
+                except Exception as e:
+                    logger.error(f"Failed to process data for {symbol}: {e}")
+                    traceback.print_exc()
                     continue
 
-                if isinstance(df.columns, pd.MultiIndex):
-                    df.columns = df.columns.droplevel(1)
+            logger.info(f"Calculating features for {symbol}...")
+            features = self._calculate_features(df)
+            
+            combined_df = pd.concat([df, features], axis=1)
+            combined_df.dropna(inplace=True)
+            
+            feature_cols = [col for col in features.columns if col in combined_df.columns]
+            if not feature_cols:
+                logger.warning(f"No valid features generated for {symbol}. Skipping.")
+                continue
 
-                df.columns = [col.lower() for col in df.columns]
-
-                logger.info(f"Calculating features for {symbol}...")
-                features = self._calculate_features(df)
-                
-                combined_df = pd.concat([df, features], axis=1)
-                combined_df.dropna(inplace=True)
-                
-                feature_cols = [col for col in features.columns if col in combined_df.columns]
-                if not feature_cols:
-                    logger.warning(f"No valid features generated for {symbol}. Skipping.")
-                    continue
-
-                all_feature_dfs.append(combined_df[feature_cols])
-                self.symbol_data[symbol] = combined_df
-
-            except Exception as e:
-                logger.error(f"Failed to process data for {symbol}: {e}")
-                traceback.print_exc()
+            all_feature_dfs.append(combined_df[feature_cols])
+            self.symbol_data[symbol] = combined_df
 
         if not all_feature_dfs:
             logger.error("No data could be fetched or processed for any symbol. Exiting.")
