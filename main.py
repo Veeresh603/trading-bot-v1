@@ -15,10 +15,11 @@ except ImportError:
     print("Please install smartapi-python: pip install smartapi-python")
     sys.exit(1)
 
-from config import Config, BacktestConfig
+from config import Config
 from core.strategy import AIStrategy
 from core.data import HistoricalDataHandler
 from core.utils import logger, telegram
+from core.execution import BacktestExecutionHandler
 
 class LiveBrokerManager:
     """
@@ -30,6 +31,7 @@ class LiveBrokerManager:
         self.websocket = None
         self.on_tick_callback = None
         self.on_connect_callback = None
+        self.access_token = None
 
     def login(self) -> bool:
         """Logs into the broker using credentials from the config."""
@@ -39,6 +41,7 @@ class LiveBrokerManager:
             if data['status'] and data['data']['jwtToken']:
                 logger.info("✅ Broker login successful.")
                 self.api_client.setAccessToken(data['data']['jwtToken'])
+                self.access_token = data['data']['jwtToken']
                 return True
             else:
                 logger.error(f"Broker login failed: {data['message']}")
@@ -47,36 +50,35 @@ class LiveBrokerManager:
             logger.error(f"An exception occurred during broker login: {e}")
             return False
 
-    def place_order(self, symbol, quantity, direction):
+    def place_order(self, order_params):
         """Places an order with the broker."""
-        logger.info(f"PLACING LIVE ORDER: {direction} {quantity} of {symbol}")
-        telegram.send_message(f"🚀 *LIVE ORDER*: {direction} {quantity} {symbol}")
-        
         try:
-            order_params = {
-                "variety": "NORMAL",
-                "tradingsymbol": symbol,
-                "symboltoken": Config.INSTRUMENT_TOKENS[symbol],
-                "transactiontype": "BUY" if direction == "BUY" else "SELL",
-                "exchange": "NSE" if ".NS" in symbol else "BSE",
-                "ordertype": "MARKET",
-                "producttype": "INTRADAY",
-                "duration": "DAY",
-                "price": 0,
-                "quantity": quantity
-            }
             order_id = self.api_client.placeOrder(order_params)
             logger.info(f"Order placed successfully. Order ID: {order_id}")
-            telegram.send_message(f"Order for {symbol} placed successfully with ID: {order_id}")
+            telegram.send_message(f"Order for {order_params['tradingsymbol']} placed successfully with ID: {order_id}")
+            return order_id
         except Exception as e:
             logger.error(f"Failed to place order: {e}")
+            return None
+            
+    def get_order_status(self, order_id):
+        """Checks the status of a specific order."""
+        try:
+            order_history = self.api_client.getOrderHistory()
+            for order in order_history:
+                if order['orderid'] == order_id:
+                    return order['status']
+            return "NOT_FOUND"
+        except Exception as e:
+            logger.error(f"Failed to get order status: {e}")
+            return "ERROR"
 
     def setup_websockets(self, on_tick_callback, on_connect_callback):
         """Initializes and connects the WebSocket for live data."""
         self.on_tick_callback = on_tick_callback
         self.on_connect_callback = on_connect_callback
         
-        auth_token = self.api_client.access_token
+        auth_token = self.access_token
         api_key = Config.API_KEY
         client_code = Config.CLIENT_ID
         
@@ -95,7 +97,7 @@ class LiveBrokerManager:
         if self.on_connect_callback:
             self.on_connect_callback(response)
         
-        tokens_to_subscribe = list(Config.INSTRUMENT_TOKENS.values())
+        tokens_to_subscribe = [str(token) for token in Config.INSTRUMENT_TOKENS.values()]
         self.websocket.subscribe(tokens_to_subscribe)
         logger.info(f"Subscribed to {len(tokens_to_subscribe)} instrument tokens.")
             
@@ -103,6 +105,86 @@ class LiveBrokerManager:
         if self.websocket:
             self.websocket.close()
 
+class LiveExecutionHandler:
+    """
+    Handles the entire lifecycle of an order in a live trading environment,
+    including placing orders, checking status, and managing fills.
+    """
+    def __init__(self, broker: LiveBrokerManager):
+        self.broker = broker
+        self.pending_orders = {}
+        self.filled_orders = []
+        self.order_monitor_thread = None
+        self.stop_monitoring = threading.Event()
+
+    def place_order(self, order_data: dict):
+        """
+        Places a new order with the broker and adds it to the pending order book.
+        """
+        symbol = order_data['symbol']
+        direction = order_data['direction']
+        quantity = order_data['quantity']
+        order_type = order_data.get('order_type', 'MARKET')
+        price = order_data.get('price', 0)
+        
+        logger.info(f"Placing new {order_type} order for {direction} {quantity} of {symbol} at price {price}")
+        
+        order_params = {
+            "variety": "NORMAL",
+            "tradingsymbol": symbol,
+            "symboltoken": Config.INSTRUMENT_TOKENS.get(symbol),
+            "transactiontype": "BUY" if direction == "BUY" else "SELL",
+            "exchange": "NSE" if ".NS" in symbol else "BSE",
+            "ordertype": order_type,
+            "producttype": "INTRADAY",
+            "duration": "DAY",
+            "price": price,
+            "quantity": quantity
+        }
+        
+        broker_order_id = self.broker.place_order(order_params)
+        
+        if broker_order_id:
+            self.pending_orders[broker_order_id] = {
+                'id': broker_order_id,
+                'symbol': symbol,
+                'direction': direction,
+                'quantity': quantity,
+                'status': 'PENDING'
+            }
+            logger.info(f"Order {broker_order_id} added to pending list.")
+
+    def start_order_monitor(self):
+        """Starts a background thread to monitor pending orders."""
+        self.order_monitor_thread = threading.Thread(target=self._monitor_orders, daemon=True)
+        self.order_monitor_thread.start()
+        logger.info("Order monitoring thread started.")
+    
+    def _monitor_orders(self):
+        """Continuously checks the status of pending orders."""
+        while not self.stop_monitoring.is_set():
+            if not self.pending_orders:
+                time.sleep(1)
+                continue
+                
+            orders_to_remove = []
+            for order_id, order in self.pending_orders.items():
+                status = self.broker.get_order_status(order_id)
+                if status == "COMPLETE":
+                    logger.info(f"Order {order_id} for {order['symbol']} is COMPLETE.")
+                    self.filled_orders.append(order)
+                    orders_to_remove.append(order_id)
+                elif status in ["REJECTED", "CANCELLED"]:
+                    logger.warning(f"Order {order_id} for {order['symbol']} was {status}.")
+                    orders_to_remove.append(order_id)
+            
+            for order_id in orders_to_remove:
+                del self.pending_orders[order_id]
+                
+            time.sleep(10)
+
+    def stop_monitor(self):
+        self.stop_monitoring.set()
 
 class LiveDataHandler:
     """
@@ -114,13 +196,14 @@ class LiveDataHandler:
         self.timeframe = timedelta(minutes=timeframe_minutes)
         self.scaler = scaler
         self.on_bar_callback = on_bar_callback
-        
         self.tick_buffers = {symbol: [] for symbol in symbols}
-        self.current_bars = {symbol: None for symbol in symbols}
         self.last_bar_timestamp = None
+        self.last_tick_time = datetime.now()
+        self.last_prices = {symbol: None for symbol in symbols}
 
     def on_new_tick(self, ticks):
         """Processes a single incoming tick."""
+        self.last_tick_time = datetime.now()
         for tick in ticks:
             symbol = self._map_token_to_symbol(tick.get('instrument_token'))
             if symbol not in self.symbols:
@@ -131,7 +214,8 @@ class LiveDataHandler:
             
             if price is None or volume is None:
                 continue
-                
+            
+            self.last_prices[symbol] = price
             now = datetime.now()
             
             if self.last_bar_timestamp is None:
@@ -139,8 +223,7 @@ class LiveDataHandler:
             
             if now >= self.last_bar_timestamp + self.timeframe:
                 for s in self.symbols:
-                    if self.tick_buffers[s]:
-                        self._finalize_and_process_bar(s)
+                    self._finalize_and_process_bar(s)
                 self.last_bar_timestamp = self._get_bar_start_time(now)
                 for s in self.symbols:
                     self.tick_buffers[s] = []
@@ -148,19 +231,28 @@ class LiveDataHandler:
             self.tick_buffers[symbol].append({'price': price, 'volume': volume})
 
     def _finalize_and_process_bar(self, symbol):
-        """Creates a final OHLCV bar from the tick buffer and processes it."""
+        """
+        Creates a final OHLCV bar from the tick buffer and processes it.
+        Handles market gaps by using the last known price.
+        """
         ticks = self.tick_buffers[symbol]
-        if not ticks: return
-
-        df_ticks = pd.DataFrame(ticks)
         
-        bar = {
-            'open': df_ticks['price'].iloc[0],
-            'high': df_ticks['price'].max(),
-            'low': df_ticks['price'].min(),
-            'close': df_ticks['price'].iloc[-1],
-            'volume': df_ticks['volume'].sum()
-        }
+        if not ticks and self.last_prices[symbol] is not None:
+            # Handle market gaps: no ticks received for this symbol in this bar
+            last_price = self.last_prices[symbol]
+            bar = {'open': last_price, 'high': last_price, 'low': last_price, 'close': last_price, 'volume': 0}
+            logger.warning(f"Market gap detected for {symbol}. Creating placeholder bar with last price {last_price}.")
+        elif not ticks:
+            return # No data available at all for this symbol
+        else:
+            df_ticks = pd.DataFrame(ticks)
+            bar = {
+                'open': df_ticks['price'].iloc[0],
+                'high': df_ticks['price'].max(),
+                'low': df_ticks['price'].min(),
+                'close': df_ticks['price'].iloc[-1],
+                'volume': df_ticks['volume'].sum()
+            }
 
         temp_df = pd.DataFrame([bar])
         features = HistoricalDataHandler._calculate_features(self, temp_df)
@@ -215,6 +307,19 @@ class TradingBot:
         self.current_positions = {symbol: 0 for symbol in Config.SYMBOLS_TO_TRADE}
         if not self.is_live:
             self._setup_paper_trading_log()
+        else:
+            self.live_execution_handler = LiveExecutionHandler(self.broker)
+
+    def _get_fitted_scaler(self):
+        """
+        Initializes a HistoricalDataHandler just to get a scaler
+        fitted on historical data. This ensures live data is scaled
+        identically to training/backtesting data.
+        """
+        logger.info("Fitting scaler on historical data...")
+        hist_data = HistoricalDataHandler(Config.SYMBOLS_TO_TRADE, "2020-01-01", "2024-01-01", Config.HISTORICAL_DATA_TIMEFRAME)
+        logger.info("✅ Scaler ready.")
+        return hist_data.scaler
         
     def initialize(self) -> bool:
         """Connects to the broker."""
@@ -239,7 +344,7 @@ class TradingBot:
         position = self.current_positions[symbol]
         
         direction = "NONE"
-        if action == 1 and confidence >= 0.75:
+        if action == 1 and confidence >= Config.MIN_CONFIDENCE_TO_TRADE:
             direction = "LONG"
         elif action == 0 and position > 0:
             direction = "EXIT"
@@ -261,7 +366,13 @@ class TradingBot:
     def execute_trade(self, symbol, quantity, direction, price):
         """Executes a trade in either live or paper mode."""
         if self.is_live:
-            self.broker.place_order(symbol, quantity, direction)
+            self.live_execution_handler.place_order({
+                'symbol': symbol,
+                'direction': direction,
+                'quantity': quantity,
+                'order_type': 'MARKET',
+                'price': price
+            })
         else:
             self._log_paper_trade(symbol, direction, price, quantity)
             
@@ -287,9 +398,16 @@ class TradingBot:
                 on_tick_callback=self.data_handler.on_new_tick,
                 on_connect_callback=lambda resp: telegram.send_message("✅ *Live Data Feed Connected*")
             )
+            self.live_execution_handler.start_order_monitor()
         
         try:
+            # Watchdog timer to monitor data feed reliability
+            WATCHDOG_TIMEOUT = 120 # Seconds
             while not self.shutdown_event.is_set():
+                if self.is_live and (datetime.now() - self.data_handler.last_tick_time).total_seconds() > WATCHDOG_TIMEOUT:
+                    logger.error("🚨 Watchdog timer expired! No ticks received. Shutting down to prevent bad trades.")
+                    telegram.send_message("🚨 Watchdog timer expired. No ticks received for 2 minutes. Shutting down!")
+                    break
                 time.sleep(1)
         except KeyboardInterrupt:
             logger.info("Shutdown signal received.")
@@ -301,7 +419,9 @@ class TradingBot:
         logger.info("--- Shutting Down Bot ---")
         telegram.send_message("👋 *Bot is shutting down...*")
         self.shutdown_event.set()
-        self.broker.close_connection()
+        if self.is_live:
+            self.live_execution_handler.stop_monitor()
+            self.broker.close_connection()
         logger.info("--- Bot Shutdown Complete ---")
         sys.exit(0)
 

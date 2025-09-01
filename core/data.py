@@ -176,3 +176,9 @@ class HistoricalDataHandler:
             start_idx = max(0, end_idx - Config.SEQUENCE_LENGTH + 1)
             return data.iloc[start_idx:end_idx + 1]
         return None
+    
+    def get_atr(self, symbol, current_time):
+        """Returns the ATR value for a given symbol at a specific time."""
+        if symbol in self.symbol_data and current_time in self.symbol_data[symbol].index:
+            return self.symbol_data[symbol].loc[current_time, 'ATR']
+        return None
