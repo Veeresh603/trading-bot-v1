@@ -5,11 +5,8 @@ import sys
 import requests
 from dotenv import load_dotenv
 
-# --- Load Environment Variables ---
-# This ensures that credentials are loaded once and are available project-wide
 load_dotenv()
 
-# --- Centralized Logger Setup ---
 def setup_logger():
     """
     Sets up a centralized logger that is robust to unicode characters.
@@ -18,17 +15,12 @@ def setup_logger():
     logger = logging.getLogger("TradingBot")
     logger.setLevel(logging.INFO)
 
-    # Prevent the logger from propagating to the root logger
     logger.propagate = False
 
-    # Check if handlers are already added to prevent duplicate logs
     if not logger.handlers:
-        # --- THE FIX IS HERE ---
-        # Use a StreamHandler with UTF-8 encoding to support emojis and other characters
-        # This is crucial for running on Windows without UnicodeEncodeError.
         handler = logging.StreamHandler(sys.stdout)
         handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
-        handler.encoding = 'utf-8' # Explicitly set the encoding
+        handler.encoding = 'utf-8'
         
         logger.addHandler(handler)
         
@@ -36,8 +28,6 @@ def setup_logger():
 
 logger = setup_logger()
 
-
-# --- Centralized Telegram Messenger ---
 class TelegramMessenger:
     """
     Handles all communication with the Telegram API.
@@ -68,5 +58,4 @@ class TelegramMessenger:
         except requests.exceptions.RequestException as e:
             logger.error(f"Failed to send Telegram message: {e}")
 
-# Create a single, project-wide instance of the messenger
 telegram = TelegramMessenger()

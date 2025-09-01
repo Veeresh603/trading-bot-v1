@@ -1,6 +1,7 @@
 # core/execution.py
 from .utils import logger
 import random
+from datetime import datetime
 
 class SimulatedExecutionHandler:
     """
@@ -20,13 +21,10 @@ class SimulatedExecutionHandler:
 
     def _calculate_costs(self, price: float, quantity: int, direction: str):
         """Calculates commission and simulates slippage."""
-        # --- Commission ---
         commission = (price * quantity) * (self.commission_bps / 10000.0)
 
-        # --- Slippage ---
         slippage_amount = (price * (self.slippage_bps / 10000.0)) * random.choice([-1, 1])
         
-        # Slippage hurts you on both buys and sells
         if direction == 'BUY':
             fill_price = price + abs(slippage_amount)
         elif direction == 'SELL':
@@ -47,11 +45,9 @@ class SimulatedExecutionHandler:
         symbol = order['symbol']
         direction = order['direction']
         quantity = order['quantity']
-        price = bar_data['close'] # Ideal execution price
-        timestamp = bar_data.name # The datetime index of the bar
+        price = bar_data['close']
+        timestamp = bar_data.name
 
         fill_price, commission = self._calculate_costs(price, quantity, direction)
 
-        # Update the portfolio with the results of the execution
         portfolio.execute_trade(order, fill_price, timestamp, commission)
-

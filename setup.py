@@ -14,7 +14,6 @@ if not os.path.isdir(LIBTORCH_PATH):
 
 ai_core_extension = Extension(
     name="ai_core_wrapper",
-    # The ONLY source is the .pyx file now
     sources=["ai_core_wrapper/ai_core_wrapper.pyx"],
     language="c++",
     include_dirs=[

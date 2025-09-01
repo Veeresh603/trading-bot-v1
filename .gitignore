@@ -40,3 +40,5 @@ Ignore configuration folders created by common code editors.
 *.log
 *.ts 
 *.pt
+*.csv
+*.html

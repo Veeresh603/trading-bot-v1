@@ -25,12 +25,11 @@ def generate_html_report(returns: pd.Series, trades_filepath: str, run_name: str
     try:
         output_filename = f"report_{run_name}.html"
         
-        # Load trades for transaction analysis
         trades_df = pd.read_csv(trades_filepath, index_col=0, parse_dates=True)
 
         qs.reports.html(
             returns=returns,
-            benchmark=None,  # You can add a benchmark like '^NSEI' for Nifty 50
+            benchmark=None,
             title=f"{run_name} - Performance Report",
             output=output_filename,
             trades=trades_df

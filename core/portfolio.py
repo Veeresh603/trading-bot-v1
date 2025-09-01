@@ -2,6 +2,7 @@
 import pandas as pd
 from .utils import logger
 from datetime import datetime
+from config import BacktestConfig
 
 class Portfolio:
     """
@@ -10,7 +11,7 @@ class Portfolio:
     """
     def __init__(self, initial_capital: float):
         self.initial_capital = initial_capital
-        self.positions = pd.DataFrame(columns=['entry_price', 'quantity', 'market_value'])
+        self.positions = pd.DataFrame(columns=['entry_price', 'quantity', 'market_value', 'trailing_high', 'stop_loss_level', 'take_profit_level'])
         self.holdings = {'cash': initial_capital, 'positions_value': 0.0, 'total': initial_capital}
         self.trades = []
         self.equity_curve = pd.Series(dtype='float64')
@@ -19,6 +20,25 @@ class Portfolio:
     def update_market_data(self, timestamp: datetime, market_data: dict):
         """Updates the market value of all open positions based on the latest bar."""
         positions_value = 0.0
+        
+        # Check for stop-loss or take-profit on open positions
+        if not self.positions.empty:
+            for symbol in list(self.positions.index):
+                if symbol in market_data:
+                    latest_price = market_data[symbol]['close']
+                    
+                    if latest_price > self.positions.at[symbol, 'trailing_high']:
+                        self.positions.at[symbol, 'trailing_high'] = latest_price
+                    
+                    self.positions.at[symbol, 'stop_loss_level'] = self.positions.at[symbol, 'trailing_high'] * (1 - BacktestConfig.TRAILING_STOP_PCT)
+                    
+                    if latest_price <= self.positions.at[symbol, 'stop_loss_level']:
+                        logger.warning(f"STOP-LOSS triggered for {symbol} at {latest_price:.2f} (level: {self.positions.at[symbol, 'stop_loss_level']:.2f})")
+                        self.create_order_from_signal({'symbol': symbol, 'direction': 'SELL', 'confidence': 1.0}, market_data[symbol])
+                    elif latest_price >= self.positions.at[symbol, 'take_profit_level']:
+                        logger.warning(f"TAKE-PROFIT triggered for {symbol} at {latest_price:.2f} (level: {self.positions.at[symbol, 'take_profit_level']:.2f})")
+                        self.create_order_from_signal({'symbol': symbol, 'direction': 'SELL', 'confidence': 1.0}, market_data[symbol])
+
         for symbol in self.positions.index:
             if symbol in market_data:
                 latest_price = market_data[symbol]['close']
@@ -31,11 +51,12 @@ class Portfolio:
 
     def create_order_from_signal(self, signal: dict, bar_data: pd.Series):
         """Validates a signal and creates an order if risk checks pass."""
+        if not isinstance(signal, dict) or signal.get('direction') == 'HOLD':
+            return None
+
         symbol = signal['symbol']
         direction = signal['direction']
         
-        # --- Risk Management ---
-        # 1. Check if we can open/close a position
         if direction == 'BUY' and symbol in self.positions.index:
             logger.debug(f"Signal to BUY {symbol} ignored: position already open.")
             return None
@@ -43,14 +64,13 @@ class Portfolio:
             logger.debug(f"Signal to SELL {symbol} ignored: no open position.")
             return None
 
-        # 2. Position Sizing (Example: Risk 1% of total equity)
         price = bar_data['close']
         if direction == 'BUY':
             quantity = self._calculate_position_size(price)
             if self.holdings['cash'] < quantity * price:
                 logger.warning(f"Not enough cash for {symbol}. Order size reduced.")
                 quantity = int(self.holdings['cash'] / price)
-        else: # SELL
+        else:
             quantity = self.positions.at[symbol, 'quantity']
 
         if quantity <= 0:
@@ -62,8 +82,7 @@ class Portfolio:
         """A simple position sizing method."""
         if price <= 0: return 0
         risk_amount = self.holdings['total'] * risk_pct
-        # Assuming a fixed 5% stop loss for sizing calculation
-        stop_loss_price = price * 0.95 
+        stop_loss_price = price * 0.95
         risk_per_share = price - stop_loss_price
         if risk_per_share <= 0: return 0
         
@@ -79,7 +98,14 @@ class Portfolio:
         self.trade_count += 1
         
         if direction == 'BUY':
-            self.positions.loc[symbol] = [fill_price, quantity, quantity * fill_price]
+            self.positions.loc[symbol] = [
+                fill_price, 
+                quantity, 
+                quantity * fill_price,
+                fill_price,
+                fill_price * (1 - BacktestConfig.TRAILING_STOP_PCT),
+                fill_price * (1 + BacktestConfig.TAKE_PROFIT_PCT)
+            ]
             self.holdings['cash'] -= quantity * fill_price
             action = "BOUGHT"
         elif direction == 'SELL':
@@ -95,4 +121,3 @@ class Portfolio:
             'timestamp': timestamp, 'symbol': symbol, 'direction': direction,
             'quantity': quantity, 'price': fill_price, 'commission': commission
         })
-

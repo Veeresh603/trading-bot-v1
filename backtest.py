@@ -7,6 +7,8 @@ from core.portfolio import Portfolio
 from core.execution import SimulatedExecutionHandler
 from core.utils import logger, telegram
 import reports
+import pandas as pd
+from datetime import datetime
 
 def run_backtest(strategy_name: str, symbol: str):
     """
@@ -15,7 +17,6 @@ def run_backtest(strategy_name: str, symbol: str):
     logger.info(f"--- Starting Backtest for {strategy_name} on {symbol} ---")
     logger.info(f"Period: {BacktestConfig.START_DATE} to {BacktestConfig.END_DATE} | Initial Capital: ${BacktestConfig.INITIAL_CAPITAL:,.2f}")
     
-    # --- Send Start Notification ---
     telegram.send_message(
         f"🚀 *Starting Backtest*\n\n"
         f"*Strategy:* `{strategy_name}`\n"
@@ -23,12 +24,11 @@ def run_backtest(strategy_name: str, symbol: str):
         f"*Period:* `{BacktestConfig.START_DATE}` to `{BacktestConfig.END_DATE}`"
     )
 
-    # --- Initialization ---
     data_handler = HistoricalDataHandler(
         symbols=[symbol],
         start_date=BacktestConfig.START_DATE,
         end_date=BacktestConfig.END_DATE,
-        timeframe='1d' # Backtesting on daily data for long periods
+        timeframe='1d'
     )
     
     historical_data = data_handler.symbol_data.get(symbol)
@@ -53,27 +53,18 @@ def run_backtest(strategy_name: str, symbol: str):
     
     logger.info(f"Loaded {len(historical_data)} data points for backtesting.")
 
-    # --- Event Loop ---
     for bar_datetime, bar_data in historical_data.iterrows():
-        # 1. Update portfolio with the latest market price
         portfolio.update_market_data(bar_datetime, {symbol: bar_data})
-
-        # 2. Strategy generates a signal based on the new data
-        # --- FIX APPLIED HERE ---
-        # Changed 'generate_signal' to 'generate_signals' to match the method name in the AIStrategy class.
+        
         signal = strategy.generate_signals(symbol, bar_datetime)
 
-        # 3. If a signal is generated, the portfolio creates an order
-        if signal:
+        if signal and signal.get('direction') != 'HOLD':
             order = portfolio.create_order_from_signal(signal, bar_data)
-            # 4. The execution handler fills the order
             if order:
                 execution_handler.execute_order(order, bar_data, portfolio)
 
-    # --- Post-Backtest Analysis ---
     logger.info("--- Backtest Complete. Generating Performance Report... ---")
     
-    # Final portfolio stats
     final_equity = portfolio.holdings['total']
     total_return = (final_equity / BacktestConfig.INITIAL_CAPITAL - 1) * 100
     total_trades = portfolio.trade_count
@@ -81,13 +72,20 @@ def run_backtest(strategy_name: str, symbol: str):
     logger.info(f"Final Portfolio Equity: ${final_equity:,.2f}")
     logger.info(f"Total Return: {total_return:.2f}%")
     logger.info(f"Total Trades Executed: {total_trades}")
+    
+    trades_df = pd.DataFrame(portfolio.trades)
+    trades_filepath = f"trades_{strategy_name}_{symbol}.csv"
+    if not trades_df.empty:
+        trades_df.to_csv(trades_filepath, index=False)
+        returns = portfolio.equity_curve.pct_change().dropna()
+        reports.generate_html_report(
+            returns=returns,
+            trades_filepath=trades_filepath,
+            run_name=f"{strategy_name}_{symbol}"
+        )
+    else:
+        logger.warning("No trades executed during backtest. Skipping report generation.")
 
-    # Generate and save detailed report using QuantStats
-    output_filename = f"report_{strategy_name}_{symbol}.html"
-    reports.generate_html_report(portfolio, output_filename)
-    logger.info(f"✅ Detailed performance report saved to '{output_filename}'")
-
-    # --- Send Completion Notification ---
     summary_message = (
         f"✅ *Backtest Complete*\n\n"
         f"*Strategy:* `{strategy_name}`\n"
@@ -95,10 +93,9 @@ def run_backtest(strategy_name: str, symbol: str):
         f"*Final Equity:* `${final_equity:,.2f}`\n"
         f"*Total Return:* `{total_return:.2f}%`\n"
         f"*Total Trades:* `{total_trades}`\n\n"
-        f"📈 Report saved to `{output_filename}`"
+        f"📈 Report saved to `report_{strategy_name}_{symbol}.html`"
     )
     telegram.send_message(summary_message)
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Professional Event-Driven Backtester")
@@ -110,4 +107,3 @@ if __name__ == "__main__":
         strategy_name=args.strategy,
         symbol=args.symbol
     )
-
