@@ -38,3 +38,5 @@ Ignore configuration folders created by common code editors.
 .idea/
 *.txt
 *.log
+*.ts 
+*.pt

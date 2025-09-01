@@ -1,165 +1,98 @@
 # core/portfolio.py
 import pandas as pd
-from math import floor
-from config import BacktestConfig
-from core.utils import logger
+from .utils import logger
+from datetime import datetime
 
 class Portfolio:
     """
-    Manages the state of the trading account: holdings, cash, and equity.
-    Generates orders based on signals and processes filled orders.
+    Manages the state of our trading account: cash, positions, and equity.
+    Also acts as the central risk manager for the backtest.
     """
-    def __init__(self, data_handler, execution_handler, initial_capital):
-        self.data_handler = data_handler
-        self.execution_handler = execution_handler
+    def __init__(self, initial_capital: float):
         self.initial_capital = initial_capital
-        self.current_positions = self._construct_initial_positions()
-        self.current_holdings = self._construct_initial_holdings()
-        
-        self.all_positions = []
-        self.all_holdings = []
-        
-        self._log_initial_state()
+        self.positions = pd.DataFrame(columns=['entry_price', 'quantity', 'market_value'])
+        self.holdings = {'cash': initial_capital, 'positions_value': 0.0, 'total': initial_capital}
         self.trades = []
+        self.equity_curve = pd.Series(dtype='float64')
+        self.trade_count = 0
 
+    def update_market_data(self, timestamp: datetime, market_data: dict):
+        """Updates the market value of all open positions based on the latest bar."""
+        positions_value = 0.0
+        for symbol in self.positions.index:
+            if symbol in market_data:
+                latest_price = market_data[symbol]['close']
+                self.positions.at[symbol, 'market_value'] = self.positions.at[symbol, 'quantity'] * latest_price
+                positions_value += self.positions.at[symbol, 'market_value']
 
-    def _construct_initial_positions(self):
-        """Creates a dictionary to hold the quantity of each symbol."""
-        positions = {symbol: 0.0 for symbol in self.data_handler.symbols}
-        return positions
+        self.holdings['positions_value'] = positions_value
+        self.holdings['total'] = self.holdings['cash'] + positions_value
+        self.equity_curve[timestamp] = self.holdings['total']
 
-    def _construct_initial_holdings(self):
-        """Creates a dictionary to hold the market value of cash and assets."""
-        holdings = {symbol: 0.0 for symbol in self.data_handler.symbols}
-        holdings['cash'] = self.initial_capital
-        holdings['commission'] = 0.0
-        holdings['total_value'] = self.initial_capital
-        return holdings
-
-    def _log_initial_state(self):
-        """Adds the initial state to the all_holdings list."""
-        initial_state = self.current_holdings.copy()
-        initial_state['timestamp'] = self.data_handler.start_date
-        self.all_holdings.append(initial_state)
-
-    def update_timeindex(self):
-        """
-        Updates the portfolio's holdings based on the latest market data.
-        This is called at the start of each new bar.
-        """
-        latest_market_values = {}
-        total_market_value = 0
+    def create_order_from_signal(self, signal: dict, bar_data: pd.Series):
+        """Validates a signal and creates an order if risk checks pass."""
+        symbol = signal['symbol']
+        direction = signal['direction']
         
-        for symbol in self.data_handler.symbols:
-            quantity = self.current_positions[symbol]
-            price = self.data_handler.get_latest_bar_value(symbol, 'Close')
-            market_value = quantity * price
-            latest_market_values[symbol] = market_value
-            total_market_value += market_value
-        
-        self.current_holdings['total_value'] = self.current_holdings['cash'] + total_market_value
-        for symbol, value in latest_market_values.items():
-            self.current_holdings[symbol] = value
+        # --- Risk Management ---
+        # 1. Check if we can open/close a position
+        if direction == 'BUY' and symbol in self.positions.index:
+            logger.debug(f"Signal to BUY {symbol} ignored: position already open.")
+            return None
+        if direction == 'SELL' and symbol not in self.positions.index:
+            logger.debug(f"Signal to SELL {symbol} ignored: no open position.")
+            return None
 
-        # Log the state for this timestamp
-        new_state = self.current_holdings.copy()
-        new_state['timestamp'] = self.data_handler.get_latest_bar_datetime()
-        self.all_holdings.append(new_state)
+        # 2. Position Sizing (Example: Risk 1% of total equity)
+        price = bar_data['close']
+        if direction == 'BUY':
+            quantity = self._calculate_position_size(price)
+            if self.holdings['cash'] < quantity * price:
+                logger.warning(f"Not enough cash for {symbol}. Order size reduced.")
+                quantity = int(self.holdings['cash'] / price)
+        else: # SELL
+            quantity = self.positions.at[symbol, 'quantity']
 
-    def process_signals(self, signals):
-        """
-        Acts on signals generated by the Strategy.
-        Generates and sends orders to the execution handler.
-        """
-        for symbol, signal_info in signals.items():
-            direction = signal_info['direction']
-            confidence = signal_info.get('confidence', 1.0) # Default confidence
-            
-            current_position = self.current_positions[symbol]
-            
-            if direction == 'LONG' and current_position == 0:
-                quantity = self._calculate_position_size(symbol, confidence)
-                if quantity > 0:
-                    self.execution_handler.place_order(symbol, quantity, 'BUY')
-            
-            elif direction == 'EXIT' and current_position > 0:
-                quantity = current_position
-                self.execution_handler.place_order(symbol, quantity, 'SELL')
+        if quantity <= 0:
+            return None
 
-    def _calculate_position_size(self, symbol, confidence):
-        """Calculates the number of shares to trade based on the sizing method."""
-        price = self.data_handler.get_latest_bar_value(symbol, 'Close')
-        
-        if BacktestConfig.SIZING_METHOD == 'fixed':
-            investment_amount = self.current_holdings['total_value'] * BacktestConfig.FIXED_POSITION_SIZE_PCT
-            return floor(investment_amount / price)
-        
-        elif BacktestConfig.SIZING_METHOD == 'kelly' and 0 < confidence < 1:
-            # A simplified Kelly Criterion implementation using model confidence
-            # This is an advanced concept.
-            # Kelly % = P(Win) - (1 - P(Win)) / (Reward/Risk)
-            # We use confidence as P(Win) and assume a 1.5 R/R ratio.
-            kelly_pct = confidence - ((1 - confidence) / 1.5)
-            if kelly_pct <= 0: return 0
-            
-            investment_amount = self.current_holdings['total_value'] * kelly_pct
-            return floor(investment_amount / price)
-            
-        return 0
+        return {'symbol': symbol, 'direction': direction, 'quantity': quantity}
 
-    def process_fills(self):
-        """
-        Processes filled orders from the execution handler, updating
-        positions and holdings accordingly.
-        """
-        while not self.execution_handler.fills_queue.empty():
-            fill_event = self.execution_handler.fills_queue.get()
-            
-            self._update_positions_from_fill(fill_event)
-            self._update_holdings_from_fill(fill_event)
-            self._log_trade(fill_event)
+    def _calculate_position_size(self, price: float, risk_pct: float = 0.01) -> int:
+        """A simple position sizing method."""
+        if price <= 0: return 0
+        risk_amount = self.holdings['total'] * risk_pct
+        # Assuming a fixed 5% stop loss for sizing calculation
+        stop_loss_price = price * 0.95 
+        risk_per_share = price - stop_loss_price
+        if risk_per_share <= 0: return 0
+        
+        return int(risk_amount / risk_per_share)
 
-    def _update_positions_from_fill(self, fill):
-        """Updates the quantity of the asset held."""
-        fill_dir = 1 if fill['direction'] == 'BUY' else -1
-        self.current_positions[fill['symbol']] += fill_dir * fill['quantity']
+    def execute_trade(self, order: dict, fill_price: float, timestamp: datetime, commission: float):
+        """Updates portfolio state after a trade is executed."""
+        symbol = order['symbol']
+        direction = order['direction']
+        quantity = order['quantity']
 
-    def _update_holdings_from_fill(self, fill):
-        """Updates cash, commissions, and asset market value."""
-        fill_dir = 1 if fill['direction'] == 'BUY' else -1
-        cost = fill_dir * fill['fill_price'] * fill['quantity']
+        self.holdings['cash'] -= commission
+        self.trade_count += 1
         
-        self.current_holdings['cash'] -= cost
-        self.current_holdings['commission'] += fill['commission']
-        self.current_holdings['cash'] -= fill['commission']
-        
-        # Update asset value immediately after fill
-        self.current_holdings[fill['symbol']] = self.current_positions[fill['symbol']] * fill['fill_price']
-        self.current_holdings['total_value'] -= fill['commission']
-        
-    def _log_trade(self, fill):
-        """Logs the details of a completed trade."""
+        if direction == 'BUY':
+            self.positions.loc[symbol] = [fill_price, quantity, quantity * fill_price]
+            self.holdings['cash'] -= quantity * fill_price
+            action = "BOUGHT"
+        elif direction == 'SELL':
+            entry_price = self.positions.at[symbol, 'entry_price']
+            pnl = (fill_price - entry_price) * quantity - commission
+            self.holdings['cash'] += quantity * fill_price
+            self.positions.drop(symbol, inplace=True)
+            action = "SOLD"
+            logger.info(f"Closed {symbol} for P/L: ${pnl:,.2f}")
+
+        logger.info(f"{action} {quantity} {symbol} @ ${fill_price:,.2f}")
         self.trades.append({
-            'timestamp': fill['timestamp'],
-            'symbol': fill['symbol'],
-            'direction': fill['direction'],
-            'quantity': fill['quantity'],
-            'price': fill['fill_price'],
-            'commission': fill['commission']
+            'timestamp': timestamp, 'symbol': symbol, 'direction': direction,
+            'quantity': quantity, 'price': fill_price, 'commission': commission
         })
-        logger.info(
-            f"TRADE | {fill['timestamp']} | {fill['direction']} {fill['quantity']} {fill['symbol']} "
-            f"@ {fill['fill_price']:.2f} | Commission: ${fill['commission']:.2f}"
-        )
 
-    def create_results_dataframe(self):
-        """Creates a pandas DataFrame from the holdings history."""
-        df = pd.DataFrame(self.all_holdings)
-        df.set_index('timestamp', inplace=True)
-        df['returns'] = df['total_value'].pct_change().fillna(0)
-        return df
-
-    @property
-    def trades_df(self):
-        """Returns a pandas DataFrame of all trades."""
-        return pd.DataFrame(self.trades).set_index('timestamp')

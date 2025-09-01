@@ -1,83 +1,98 @@
 # core/model.py
-import os
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import numpy as np
-from typing import Tuple
-
+import os
 from config import Config
 from .utils import logger
 
-# Import the C++ engine
+# --- C++ Engine (Optional, for performance) ---
 try:
+    # This will try to import the compiled C++ extension
     from ai_core_wrapper import PyFastLSTMEngine
+    logger.info("✅ Successfully imported high-performance C++ AI engine module.")
 except ImportError:
-    logger.critical("Could not import C++ engine 'ai_core_wrapper'. The bot will fall back to slower PyTorch inference.")
     PyFastLSTMEngine = None
+    logger.warning("C++ engine module not found or not compiled. Falling back to Python engine.")
 
 
 class LSTMBrain(nn.Module):
     """
-    Unified LSTM model for both training (PyTorch) and high-speed inference (C++).
+    Defines the core LSTM neural network architecture for the trading AI.
     """
     def __init__(self):
-        super().__init__()
+        super(LSTMBrain, self).__init__()
+        self.input_size = Config.INPUT_SIZE
+        self.hidden_size = Config.HIDDEN_SIZE
+        self.num_layers = Config.NUM_LAYERS
+        self.output_size = 3  # Buy, Sell, Hold
+
         self.lstm = nn.LSTM(
-            Config.INPUT_SIZE,
-            Config.HIDDEN_SIZE,
-            Config.NUM_LAYERS,
+            self.input_size,
+            self.hidden_size,
+            self.num_layers,
             batch_first=True,
             dropout=Config.DROPOUT
         )
-        self.fc = nn.Linear(Config.HIDDEN_SIZE, 3)  # 0: Sell, 1: Buy, 2: Hold
-
-        self.brain_cpp = None
+        self.fc = nn.Linear(self.hidden_size, self.output_size)
+        
+        self.cpp_engine = None
         self.load_cpp_engine()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        lstm_out, _ = self.lstm(x)
-        # Use the output of the last time step
-        last_time_step_out = lstm_out[:, -1, :]
-        out = self.fc(last_time_step_out)
-        # Softmax provides probability distribution over actions
-        return F.softmax(out, dim=-1)
+    def forward(self, x):
+        h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)
+        c0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)
+        
+        out, _ = self.lstm(x, (h0, c0))
+        out = self.fc(out[:, -1, :])
+        return out
 
     def load_cpp_engine(self):
-        """Loads the compiled C++ inference engine if available."""
+        """Loads the compiled C++ TorchScript model if available."""
         if PyFastLSTMEngine and os.path.exists(Config.TORCHSCRIPT_FILENAME):
             try:
-                self.brain_cpp = PyFastLSTMEngine(Config.TORCHSCRIPT_FILENAME)
-                logger.info("✅ Successfully loaded high-performance C++ AI engine.")
+                device = 'cuda' if torch.cuda.is_available() else 'cpu'
+                self.cpp_engine = PyFastLSTMEngine(Config.TORCHSCRIPT_FILENAME, device)
+                logger.info(f"✅ Successfully loaded high-performance C++ AI engine on {device.upper()}.")
             except Exception as e:
-                logger.error(f"❌ Failed to load C++ AI engine: {e}")
-                self.brain_cpp = None
+                logger.error(f"Failed to load C++ engine: {e}")
+                self.cpp_engine = None
         else:
-            logger.warning("C++ engine not found or TorchScript model not compiled.")
+             logger.warning("C++ engine not found or TorchScript model not compiled.")
 
-    def decide_action(self, state: np.ndarray) -> Tuple[int, float]:
+    # --- FIX APPLIED HERE ---
+    # This method was missing. It provides the necessary logic to load the
+    # saved model weights from the .pt file created during training.
+    def load_weights(self):
         """
-        Makes a trading decision. Uses the C++ engine if available, otherwise
-        falls back to the slower PyTorch model for inference.
-
-        Args:
-            state (np.ndarray): The input features for the current time step.
-
-        Returns:
-            Tuple[int, float]: The decided action (0, 1, or 2) and the confidence score.
+        Loads the trained model weights from the file specified in the config.
         """
-        if self.brain_cpp:
+        weights_file = Config.WEIGHTS_FILENAME
+        if not os.path.exists(weights_file):
+            logger.error(f"Model weights file not found at '{weights_file}'. Please train the model first.")
+            raise FileNotFoundError(f"Model weights file not found: {weights_file}")
+            
+        try:
+            device = 'cuda' if torch.cuda.is_available() else 'cpu'
+            self.load_state_dict(torch.load(weights_file, map_location=device))
+            self.to(device) # Ensure model is on the correct device
+            logger.info(f"✅ Successfully loaded model weights from '{weights_file}' to {device.upper()}.")
+        except Exception as e:
+            logger.error(f"Failed to load model weights: {e}")
+            raise e
+
+    def decide_action(self, sequence_data):
+        """
+        Uses either the C++ engine or the Python engine to make a prediction.
+        """
+        if self.cpp_engine:
             # Use high-performance C++ engine
-            action_probs = self.brain_cpp.forward(state.astype(np.float32))
+            return self.cpp_engine.decide_action(sequence_data)
         else:
-            # Fallback to PyTorch model (slower)
-            self.eval() # Set model to evaluation mode
+            # Fallback to slower Python engine
             with torch.no_grad():
-                # Reshape state to (batch_size, sequence_length, input_size)
-                state_tensor = torch.from_numpy(state).float().unsqueeze(0).unsqueeze(0)
-                action_probs_tensor = self(state_tensor)
-                action_probs = action_probs_tensor.squeeze().cpu().numpy()
-
-        action = np.argmax(action_probs).item()
-        confidence = action_probs[action].item()
-        return action, confidence
+                device = next(self.parameters()).device
+                sequence_tensor = torch.from_numpy(sequence_data).float().unsqueeze(0).to(device)
+                prediction = self(sequence_tensor)
+                confidence = torch.softmax(prediction, dim=1).max().item()
+                action_index = torch.argmax(prediction, dim=1).item()
+                return action_index, confidence

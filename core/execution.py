@@ -1,57 +1,57 @@
 # core/execution.py
-import queue
-from datetime import datetime
+from .utils import logger
+import random
 
 class SimulatedExecutionHandler:
     """
-    Simulates the execution of orders, including slippage and commissions.
-    This is a crucial component for realistic backtesting.
+    Simulates the execution of trades, including realistic costs
+    like commissions and slippage.
     """
-    def __init__(self, commission_per_trade, slippage_pct):
-        self.commission = commission_per_trade
-        self.slippage_pct = slippage_pct
-        self.fills_queue = queue.Queue()
+    def __init__(self, commission_bps: int = 0, slippage_bps: int = 0):
+        """
+        Initializes the execution handler.
 
-    def place_order(self, symbol, quantity, direction):
+        Args:
+            commission_bps (int): The commission fee in basis points (e.g., 5 bps = 0.05%).
+            slippage_bps (int): The estimated slippage in basis points.
         """
-        Simulates placing an order. In a real system, this would
-        interact with a broker's API. Here, it simulates the fill.
-        """
-        # In a backtest, we assume the order is filled on the next bar's open.
-        # This is a simplification. More complex models could use VWAP.
-        # For simplicity, we'll just create a fill event to be processed.
-        # The actual price will be determined by the Portfolio using next bar's data.
-        # Here we just queue the intent to trade.
-        # A more realistic model would require the data_handler here to get the fill price.
-        # For now, the portfolio will handle the fill logic.
+        self.commission_bps = commission_bps
+        self.slippage_bps = slippage_bps
+
+    def _calculate_costs(self, price: float, quantity: int, direction: str):
+        """Calculates commission and simulates slippage."""
+        # --- Commission ---
+        commission = (price * quantity) * (self.commission_bps / 10000.0)
+
+        # --- Slippage ---
+        slippage_amount = (price * (self.slippage_bps / 10000.0)) * random.choice([-1, 1])
         
-        # In this simplified model, we will let the portfolio create the fill event
-        # since it has access to the next bar's data. This handler is more of a
-        # placeholder for where broker interaction logic would go.
-        # A better implementation would pass the data_handler to this class.
-        pass # The Portfolio will directly create fill events for simplicity.
-    
-    def calculate_fill_price(self, ideal_price, direction):
-        """Calculates the execution price including slippage."""
+        # Slippage hurts you on both buys and sells
         if direction == 'BUY':
-            return ideal_price * (1 + self.slippage_pct)
-        else: # SELL
-            return ideal_price * (1 - self.slippage_pct)
+            fill_price = price + abs(slippage_amount)
+        elif direction == 'SELL':
+            fill_price = price - abs(slippage_amount)
+        else:
+            fill_price = price
 
-    def calculate_commission(self, trade_value):
-        """Calculates the commission for a trade."""
-        return trade_value * self.commission
-        
-    def create_fill_event(self, timestamp, symbol, quantity, direction, fill_price):
-        """Creates a fill event and puts it in the queue."""
-        trade_value = fill_price * quantity
-        commission = self.calculate_commission(trade_value)
-        fill = {
-            'timestamp': timestamp,
-            'symbol': symbol,
-            'quantity': quantity,
-            'direction': direction,
-            'fill_price': fill_price,
-            'commission': commission
-        }
-        self.fills_queue.put(fill)
+        return fill_price, commission
+
+    def execute_order(self, order: dict, bar_data, portfolio):
+        """
+        Executes an order, updates the portfolio, and logs the trade.
+        The portfolio object is now passed here directly.
+        """
+        if not order:
+            return
+
+        symbol = order['symbol']
+        direction = order['direction']
+        quantity = order['quantity']
+        price = bar_data['close'] # Ideal execution price
+        timestamp = bar_data.name # The datetime index of the bar
+
+        fill_price, commission = self._calculate_costs(price, quantity, direction)
+
+        # Update the portfolio with the results of the execution
+        portfolio.execute_trade(order, fill_price, timestamp, commission)
+

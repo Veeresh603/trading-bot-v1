@@ -1,60 +1,72 @@
 # core/utils.py
 import logging
+import os
+import sys
 import requests
-from config import Config
+from dotenv import load_dotenv
 
+# --- Load Environment Variables ---
+# This ensures that credentials are loaded once and are available project-wide
+load_dotenv()
+
+# --- Centralized Logger Setup ---
 def setup_logger():
-    """Sets up a dual-output logger."""
+    """
+    Sets up a centralized logger that is robust to unicode characters.
+    This logger will be used by all modules in the project.
+    """
     logger = logging.getLogger("TradingBot")
     logger.setLevel(logging.INFO)
 
-    # Prevent adding multiple handlers if logger is already configured
-    if logger.hasHandlers():
-        return logger
+    # Prevent the logger from propagating to the root logger
+    logger.propagate = False
 
-    # File handler
-    fh = logging.FileHandler("trading_bot.log")
-    fh.setLevel(logging.INFO)
-
-    # Console handler
-    ch = logging.StreamHandler()
-    ch.setLevel(logging.INFO)
-
-    # Formatter
-    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    fh.setFormatter(formatter)
-    ch.setFormatter(formatter)
-
-    # Add handlers
-    logger.addHandler(fh)
-    logger.addHandler(ch)
-
+    # Check if handlers are already added to prevent duplicate logs
+    if not logger.handlers:
+        # --- THE FIX IS HERE ---
+        # Use a StreamHandler with UTF-8 encoding to support emojis and other characters
+        # This is crucial for running on Windows without UnicodeEncodeError.
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+        handler.encoding = 'utf-8' # Explicitly set the encoding
+        
+        logger.addHandler(handler)
+        
     return logger
 
-class TelegramManager:
-    """Manages sending messages to a Telegram chat."""
-    def __init__(self):
-        self.token = Config.TELEGRAM_TOKEN
-        self.chat_id = Config.TELEGRAM_CHAT_ID
-        self.base_url = f"https://api.telegram.org/bot{self.token}/sendMessage"
+logger = setup_logger()
 
-    def send_message(self, message: str):
-        if not self.token or not self.chat_id:
+
+# --- Centralized Telegram Messenger ---
+class TelegramMessenger:
+    """
+    Handles all communication with the Telegram API.
+    """
+    def __init__(self):
+        self.token = os.getenv("TELEGRAM_BOT_TOKEN")
+        self.chat_id = os.getenv("TELEGRAM_CHAT_ID")
+        self.is_configured = self.token and self.chat_id
+
+        if not self.is_configured:
+            logger.warning("Telegram credentials not found in .env file. Notifications will be disabled.")
+
+    def send_message(self, text: str):
+        """Sends a message to the configured Telegram chat."""
+        if not self.is_configured:
             return
 
-        payload = {
-            'chat_id': self.chat_id,
-            'text': message,
-            'parse_mode': 'Markdown'
+        url = f"https://api.telegram.org/bot{self.token}/sendMessage"
+        params = {
+            "chat_id": self.chat_id,
+            "text": text,
+            "parse_mode": "Markdown"
         }
         try:
-            response = requests.post(self.base_url, data=payload, timeout=10)
+            response = requests.post(url, json=params, timeout=10)
             response.raise_for_status()
+            logger.debug("Telegram message sent successfully.")
         except requests.exceptions.RequestException as e:
-            # Use the global logger instance
-            logger = logging.getLogger("TradingBot")
-            logger.error(f"Telegram message failed to send: {e}")
+            logger.error(f"Failed to send Telegram message: {e}")
 
-# Initialize logger and telegram manager for global use
-logger = setup_logger()
-telegram = TelegramManager()
+# Create a single, project-wide instance of the messenger
+telegram = TelegramMessenger()
