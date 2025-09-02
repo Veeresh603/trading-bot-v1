@@ -21,7 +21,7 @@ except ImportError:
 class HistoricalDataHandler:
     """
     Handles fetching, processing, and storing historical market data.
-    It prioritizes Zerodha Kite and uses yfinance as a fallback.
+    This is the unified data handler for both training and backtesting.
     """
     def __init__(self, symbols, start_date, end_date, timeframe):
         self.symbols = symbols
@@ -47,10 +47,10 @@ class HistoricalDataHandler:
         else:
             logger.warning("KiteConnect credentials not configured. Will rely solely on yfinance.")
 
-    def _get_instrument_token(self, symbol):
-        """Gets the instrument token for a given symbol from the NSE segment."""
+    def _get_instrument_token(self, symbol, exchange="NSE"):
+        """Gets the instrument token for a given symbol."""
         try:
-            instruments = self.kite.instruments("NSE")
+            instruments = self.kite.instruments(exchange)
             df = pd.DataFrame(instruments)
             token_row = df[df['tradingsymbol'] == symbol]
             if not token_row.empty:
@@ -59,9 +59,11 @@ class HistoricalDataHandler:
             logger.error(f"Failed to get instrument token for {symbol}: {e}")
         return None
 
-    def _fetch_data_kite(self, symbol):
-        """Fetches historical data for a symbol using KiteConnect in chunks."""
-        token = self._get_instrument_token(symbol)
+    def _fetch_data_kite(self, symbol_info):
+        """Fetches historical data using KiteConnect in chunks."""
+        symbol = symbol_info['tradingsymbol'] if isinstance(symbol_info, dict) else symbol_info
+        token = symbol_info.get('instrument_token') if isinstance(symbol_info, dict) else self._get_instrument_token(symbol)
+        
         if not token:
             logger.warning(f"Could not find instrument token for {symbol}. Cannot fetch from Kite.")
             return None
@@ -77,12 +79,13 @@ class HistoricalDataHandler:
 
             while current_start <= end:
                 current_end = min(current_start + chunk_size, end)
-                logger.info(f"  Fetching chunk from {current_start} to {current_end}")
+                # logger.info(f"  Fetching chunk from {current_start} to {current_end}")
                 chunk = self.kite.historical_data(token, current_start, current_end, self.timeframe)
                 all_chunks.extend(chunk)
                 current_start += chunk_size + timedelta(days=1)
             
             if not all_chunks:
+                logger.warning(f"No data returned for {symbol} for the given period.")
                 return None
 
             df = pd.DataFrame(all_chunks)
@@ -96,65 +99,24 @@ class HistoricalDataHandler:
             logger.error(f"Failed to fetch data from Kite for {symbol}: {e}")
             return None
 
-    def _fetch_data_yfinance(self, symbol):
-        """Fetches historical data using yfinance as a fallback."""
-        logger.info(f"Fetching historical data for {symbol} using yfinance as fallback...")
-        try:
-            yf_symbol = '^NSEI' if symbol == 'NIFTY 50' else symbol
-            yf_interval = self.timeframe.replace('minute', 'm')
-
-            df = yf.download(yf_symbol, start=self.start_date, end=self.end_date, interval=yf_interval, progress=False, auto_adjust=True)
-            
-            if df.empty:
-                logger.warning(f"No data returned for {symbol} ({yf_symbol}) from yfinance.")
-                return None
-            
-            df.columns = [col.lower() for col in df.columns]
-            return df
-        except Exception as e:
-            logger.error(f"Failed to fetch data from yfinance for {symbol}: {e}")
-            return None
-
     def _fetch_and_prepare_data(self):
         """Orchestrator to fetch, process, and scale data for all symbols."""
         all_feature_dfs = []
         os.makedirs(Config.LOCAL_DATA_DIR, exist_ok=True)
 
-        for symbol in self.symbols:
-            filename_symbol = symbol.replace(' ', '').replace(':', '')
-            filepath = os.path.join(Config.LOCAL_DATA_DIR, f"{filename_symbol}_{self.timeframe}.csv")
-            df = pd.DataFrame()
-
-            if os.path.exists(filepath):
-                logger.info(f"Loading data for {symbol} from local file: {filepath}")
-                try:
-                    df = pd.read_csv(filepath, index_col=0, parse_dates=True)
-                except Exception:
-                    df = pd.DataFrame()
+        for symbol_info in self.symbols:
+            symbol = symbol_info['tradingsymbol'] if isinstance(symbol_info, dict) else symbol_info
             
-            if df.empty:
-                if self.kite:
-                    df = self._fetch_data_kite(symbol)
-                
-                if df is None or df.empty:
-                    df = self._fetch_data_yfinance(symbol)
+            df = self._fetch_data_kite(symbol_info)
 
-                if df is None or df.empty:
-                    logger.error(f"Failed to fetch data for {symbol} from all sources.")
-                    continue
-                
-                logger.info(f"Saving fetched data for {symbol} to '{filepath}'...")
-                df.to_csv(filepath)
-
-            df = df.loc[self.start_date:self.end_date]
-            if df.empty:
-                logger.warning(f"No data for {symbol} within the specified date range.")
+            if df is None or df.empty:
                 continue
 
             logger.info(f"Calculating features for {symbol}...")
             features = self._calculate_features(df)
             combined_df = pd.concat([df, features], axis=1)
             
+            # --- FIX: Drop NaNs AFTER combining to preserve data integrity ---
             combined_df.dropna(inplace=True)
             
             if combined_df.empty:
@@ -183,7 +145,10 @@ class HistoricalDataHandler:
                     self.symbol_data[symbol] = data
 
     def _calculate_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Calculates a comprehensive set of technical indicators and features."""
+        """
+        Calculates a comprehensive set of technical indicators.
+        This version is robust and identical to the training script's function.
+        """
         features = pd.DataFrame(index=df.index)
         
         open_p = df['open'].values.astype('float64')
@@ -201,29 +166,23 @@ class HistoricalDataHandler:
         features['STOCH_k'], features['STOCH_d'] = talib.STOCH(high, low, close)
         features['WILLR'] = talib.WILLR(high, low, close)
         features['TRIX'] = talib.TRIX(close)
-
         # Volatility Indicators
         features['ATR'] = talib.ATR(high, low, close)
         features['BB_upper'], features['BB_middle'], features['BB_lower'] = talib.BBANDS(close)
-        
         # Volume Indicator
         features['OBV'] = talib.OBV(close, volume)
-        
         # Trend Indicators
         features['SMA_20'] = talib.SMA(close, timeperiod=20)
         features['EMA_20'] = talib.EMA(close, timeperiod=20)
         features['SMA_50'] = talib.SMA(close, timeperiod=50)
         features['EMA_50'] = talib.EMA(close, timeperiod=50)
-
         # Price & Volume Change Features
         features['price_change_1d'] = df['close'].pct_change(1)
         features['volume_change_1d'] = df['volume'].pct_change(1)
-        
         # Time-based Features
         features['day_of_week'] = df.index.dayofweek
         features['month_of_year'] = df.index.month
-
-        # Candlestick Pattern Recognition (Examples)
+        # Candlestick Pattern Recognition
         features['CDL2CROWS'] = talib.CDL2CROWS(open_p, high, low, close)
         features['CDL3BLACKCROWS'] = talib.CDL3BLACKCROWS(open_p, high, low, close)
         
@@ -235,10 +194,8 @@ class HistoricalDataHandler:
         while len(final_features.columns) < Config.INPUT_SIZE:
             col_name = f'placeholder_{len(final_features.columns)}'
             final_features[col_name] = 0.0
-
         if len(final_features.columns) > Config.INPUT_SIZE:
             final_features = final_features.iloc[:, :Config.INPUT_SIZE]
-            
         return final_features
 
     def get_atr(self, symbol, current_time):
