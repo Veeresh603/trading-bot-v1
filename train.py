@@ -5,6 +5,7 @@ import torch.nn as nn
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
+from sklearn.utils.class_weight import compute_class_weight
 import os
 import sys
 
@@ -14,45 +15,50 @@ from core.data import HistoricalDataHandler
 from core.utils import logger
 from kiteconnect import KiteConnect
 
-def get_target_labels_triple_barrier(
-    close_prices: pd.Series,
-    profit_take_pct: float = 0.015,
-    stop_loss_pct: float = 0.008,
-    time_limit_bars: int = 10
+def get_target_labels_future_direction(
+    price_data: pd.DataFrame,
+    look_forward_bars: int = 10,
+    atr_threshold_multiplier: float = 0.5
 ) -> pd.Series:
-    """Implements the Triple Barrier Method for labeling."""
-    labels = pd.Series(2, index=close_prices.index)
+    """
+    Creates labels based on the future price direction relative to ATR.
+    - 1 (BUY): If future price > entry_price + (ATR * multiplier)
+    - 0 (SELL): If future price < entry_price - (ATR * multiplier)
+    - 2 (HOLD): If price stays within the neutral zone.
+    """
+    labels = pd.Series(2, index=price_data.index) # Default to HOLD
     
-    for i in range(len(close_prices) - time_limit_bars):
-        entry_price = close_prices.iloc[i]
-        profit_target = entry_price * (1 + profit_take_pct)
-        stop_loss_target = entry_price * (1 - stop_loss_pct)
-
-        for j in range(1, time_limit_bars + 1):
-            future_price = close_prices.iloc[i + j]
-            if future_price >= profit_target:
-                labels.iloc[i] = 1
-                break
-            elif future_price <= stop_loss_target:
-                labels.iloc[i] = 0
-                break
+    # Calculate future price `look_forward_bars` ahead
+    future_close = price_data['close'].shift(-look_forward_bars)
+    
+    # Calculate the dynamic threshold using ATR
+    atr_threshold = price_data['ATR'] * atr_threshold_multiplier
+    
+    # Conditions for BUY and SELL signals
+    buy_condition = future_close > price_data['close'] + atr_threshold
+    sell_condition = future_close < price_data['close'] - atr_threshold
+    
+    labels[buy_condition] = 1
+    labels[sell_condition] = 0
+    
+    # The rest will remain as HOLD (2)
     return labels
 
 def create_sequences(input_data: pd.DataFrame, target_data: pd.Series, seq_length: int):
     """Creates sequences and corresponding labels for the LSTM."""
     xs, ys = [], []
-    for i in range(len(input_data) - seq_length):
+    # Adjust loop to ensure target_data slicing is always valid
+    for i in range(len(input_data) - seq_length - 1):
         x = input_data.iloc[i:(i + seq_length)].values
+        # Target is the label corresponding to the *end* of the sequence
         y = target_data.iloc[i + seq_length]
-        if y in [0, 1]:
-            xs.append(x)
-            ys.append(y)
+        xs.append(x)
+        ys.append(y)
     return np.array(xs), np.array(ys)
 
 def main():
     logger.info("--- Starting AI Model Training on Underlying Asset ---")
     
-    # --- FIX: Train on the underlying symbol, not short-lived options ---
     data_handler = HistoricalDataHandler(
         symbols=[Config.UNDERLYING_SYMBOL],
         start_date=BacktestConfig.START_DATE,
@@ -64,14 +70,20 @@ def main():
         logger.error("No data available for training after processing. Exiting.")
         return
 
-    # All data is now in symbol_data, correctly processed
     processed_data = data_handler.symbol_data[Config.UNDERLYING_SYMBOL]
     feature_cols = [col for col in processed_data.columns if col not in ['open', 'high', 'low', 'close', 'volume']]
     
     features = processed_data[feature_cols]
-    labels = get_target_labels_triple_barrier(processed_data['close'])
+    
+    # Use the new, more robust labeling function
+    labels = get_target_labels_future_direction(processed_data[['close', 'ATR']])
 
-    X, y = create_sequences(features, labels, Config.SEQUENCE_LENGTH)
+    # Drop NaNs that may have been created by the label shifting
+    combined = pd.concat([features, labels.rename('target')], axis=1).dropna()
+    features_final = combined.drop('target', axis=1)
+    labels_final = combined['target']
+
+    X, y = create_sequences(features_final, labels_final, Config.SEQUENCE_LENGTH)
     
     if len(X) == 0:
         logger.error("Not enough valid sequences generated. Try a larger date range.")
@@ -79,13 +91,24 @@ def main():
         
     logger.info(f"Total training sequences created: {len(X)}")
     
+    unique, counts = np.unique(y, return_counts=True)
+    logger.info(f"Class distribution: {dict(zip(unique, counts))}")
+
+    if len(unique) < 3:
+        logger.warning("The dataset does not contain all three classes (BUY, SELL, HOLD). This may be okay but indicates low volatility or strong trends.")
+
+    class_weights = compute_class_weight('balanced', classes=np.unique(y), y=y)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    weights_tensor = torch.tensor(class_weights, dtype=torch.float).to(device)
+    logger.info(f"Calculated class weights: {class_weights}")
+
     X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
 
     model = LSTMBrain()
     optimizer = optim.Adam(model.parameters(), lr=0.001)
-    criterion = nn.CrossEntropyLoss()
-    
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    criterion = nn.CrossEntropyLoss(weight=weights_tensor)
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=7, gamma=0.1)
+
     X_train_tensor = torch.from_numpy(X_train).float().to(device)
     y_train_tensor = torch.from_numpy(y_train).long().to(device)
     X_val_tensor = torch.from_numpy(X_val).float().to(device)
@@ -105,6 +128,8 @@ def main():
             loss.backward()
             optimizer.step()
         
+        scheduler.step()
+
         model.eval()
         with torch.no_grad():
             val_outputs = model(X_val_tensor)

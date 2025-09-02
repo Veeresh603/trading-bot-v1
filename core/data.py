@@ -141,6 +141,8 @@ class HistoricalDataHandler:
             for symbol, data in self.symbol_data.items():
                 scalable_cols = [col for col in feature_cols_to_scale if col in data.columns]
                 if scalable_cols:
+                    # FIX: Ensure the dtypes are compatible before assigning scaled data
+                    data[scalable_cols] = data[scalable_cols].astype(np.float64)
                     data.loc[:, scalable_cols] = self.scaler.transform(data[scalable_cols])
                     self.symbol_data[symbol] = data
 
@@ -186,6 +188,10 @@ class HistoricalDataHandler:
         features['CDL2CROWS'] = talib.CDL2CROWS(open_p, high, low, close)
         features['CDL3BLACKCROWS'] = talib.CDL3BLACKCROWS(open_p, high, low, close)
         
+        # FIX: Convert all feature columns to float64 to prevent dtype issues with scaler
+        for col in features.columns:
+            features[col] = features[col].astype(np.float64)
+
         final_features = features.copy()
         final_features.replace([np.inf, -np.inf], np.nan, inplace=True)
         final_features.dropna(axis=1, how='all', inplace=True)

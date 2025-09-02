@@ -9,6 +9,7 @@ import logging
 from core.domain.entities.order import Order, OrderRequest
 from core.domain.entities.position import Position
 from core.infrastructure.event_bus import IEventBus, Event, EventType
+import asyncio
 
 logger = logging.getLogger(__name__)
 

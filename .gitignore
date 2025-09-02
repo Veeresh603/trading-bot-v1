@@ -42,3 +42,8 @@ Ignore configuration folders created by common code editors.
 *.pt
 *.csv
 *.html
+
+
+checkKiteConnection.py
+getInstrumentToken.py
+instrumentListOfLast.py
