@@ -2,8 +2,7 @@
 import argparse
 import sys
 from config import Config, BacktestConfig
-# --- FIX: Import the correct data handler for indices ---
-from core.data import HistoricalDataHandler
+from core.data import HistoricalDataHandler # Use the unified data handler
 from core.strategy import AIStrategy
 from core.portfolio import Portfolio
 from core.execution import BacktestExecutionHandler
@@ -11,16 +10,14 @@ from core.utils import logger, telegram
 import reports
 import pandas as pd
 from datetime import datetime
-from kiteconnect import KiteConnect
 
 def run_backtest(strategy_name: str, symbol: str):
     """
-    Main function to run the event-driven backtest on the underlying asset (e.g., NIFTY 50).
+    Main function to run the event-driven backtest on the underlying asset.
     """
     logger.info(f"--- Starting Backtest for {strategy_name} on {symbol} ---")
     logger.info(f"Period: {BacktestConfig.START_DATE} to {BacktestConfig.END_DATE} | Initial Capital: ${BacktestConfig.INITIAL_CAPITAL:,.2f}")
 
-    # --- FIX: Use HistoricalDataHandler to fetch data for the underlying index ---
     data_handler = HistoricalDataHandler(
         symbols=[symbol],
         start_date=BacktestConfig.START_DATE,
@@ -33,17 +30,12 @@ def run_backtest(strategy_name: str, symbol: str):
         telegram.send_message(f"❌ *Backtest Failed*\n\nNo historical data found for {symbol}.")
         return
 
-    portfolio = Portfolio(
-        initial_capital=BacktestConfig.INITIAL_CAPITAL
-    )
-
+    portfolio = Portfolio(initial_capital=BacktestConfig.INITIAL_CAPITAL)
     execution_handler = BacktestExecutionHandler(
         commission_bps=BacktestConfig.COMMISSION_BPS,
         slippage_bps=BacktestConfig.SLIPPAGE_BPS
     )
 
-    # --- FIX: Adapt strategy initialization for a single symbol ---
-    # The 'contracts' parameter is now a simple list with one symbol dict
     strategy_contracts = [{'trading_symbol': symbol}]
     strategy = AIStrategy(
         data_handler=data_handler,
@@ -51,15 +43,16 @@ def run_backtest(strategy_name: str, symbol: str):
         sequence_length=Config.SEQUENCE_LENGTH
     )
 
+    # The data is in symbol_data dict, get the index (timestamps) from there
     all_dates = sorted(data_handler.symbol_data[symbol].index)
     
     logger.info(f"Backtesting over a total of {len(all_dates)} market timestamps.")
 
     for bar_datetime in all_dates:
-        # --- FIX: Generate signals and execute based on the single underlying symbol ---
         current_bar = data_handler.symbol_data[symbol].loc[bar_datetime]
+        current_market_data = {symbol: current_bar}
+        portfolio.update_market_data(bar_datetime, current_market_data)
         
-        # The strategy expects a contract dictionary, so we provide one
         signal = strategy.generate_signals(strategy_contracts[0], bar_datetime)
 
         if signal and signal.get('direction') != 'HOLD':

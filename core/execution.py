@@ -21,20 +21,14 @@ class BacktestExecutionHandler:
 
     def _calculate_costs(self, price: float, quantity: int, direction: str):
         """Calculates commission and simulates slippage."""
-        # --- Commission ---
         commission = (price * quantity) * (self.commission_bps / 10000.0)
-
-        # --- Slippage ---
-        # A more realistic slippage model than a simple random choice.
-        # This assumes slippage is proportional to a percentage of the price.
-        # It adds a small random factor to simulate real market fluctuations.
-        slippage_amount = price * (self.slippage_bps / 10000.0) * (1 + random.uniform(-0.5, 0.5))
         
-        # Slippage hurts you on both buys and sells
+        slippage_amount = price * (self.slippage_bps / 10000.0) * random.uniform(0.8, 1.2)
+        
         if direction == 'BUY':
-            fill_price = price + abs(slippage_amount)
+            fill_price = price + slippage_amount
         elif direction == 'SELL':
-            fill_price = price - abs(slippage_amount)
+            fill_price = price - slippage_amount
         else:
             fill_price = price
 
@@ -50,9 +44,10 @@ class BacktestExecutionHandler:
         symbol = order['symbol']
         direction = order['direction']
         quantity = order['quantity']
-        price = bar_data['close'] # Ideal execution price
-        timestamp = bar_data.name # The datetime index of the bar
+        price = bar_data['close']
+        timestamp = bar_data.name
 
         fill_price, commission = self._calculate_costs(price, quantity, direction)
 
+        # Call the portfolio's execute_trade method with the correct arguments
         portfolio.execute_trade(order, fill_price, timestamp, commission)

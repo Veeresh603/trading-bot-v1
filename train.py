@@ -7,12 +7,10 @@ import pandas as pd
 from sklearn.model_selection import train_test_split
 import os
 import sys
-from datetime import datetime
 
-# FIX: Removed the incorrect import of 'Config' from 'config'
-from config import Config, BacktestConfig, get_current_options_contracts
+from config import Config, BacktestConfig
 from core.model import LSTMBrain
-from core.options_data import OptionsDataHandler
+from core.data import HistoricalDataHandler
 from core.utils import logger
 from kiteconnect import KiteConnect
 
@@ -22,9 +20,7 @@ def get_target_labels_triple_barrier(
     stop_loss_pct: float = 0.008,
     time_limit_bars: int = 10
 ) -> pd.Series:
-    """
-    Implements the Triple Barrier Method for labeling.
-    """
+    """Implements the Triple Barrier Method for labeling."""
     labels = pd.Series(2, index=close_prices.index)
     
     for i in range(len(close_prices) - time_limit_bars):
@@ -54,86 +50,46 @@ def create_sequences(input_data: pd.DataFrame, target_data: pd.Series, seq_lengt
     return np.array(xs), np.array(ys)
 
 def main():
-    logger.info("--- Starting Options AI Model Training ---")
-
-    kite_client = KiteConnect(api_key=Config.KITE_API_KEY)
-    try:
-        kite_client.set_access_token(Config.KITE_ACCESS_TOKEN)
-    except Exception as e:
-        logger.error(f"Failed to set access token during training setup: {e}")
-        logger.error("Please run login_kite.py to get a new access token and update your .env file.")
-        sys.exit(1)
-
-    contracts_dict = get_current_options_contracts(kite_client)
-    contracts_list = contracts_dict.get('all')
-    if not contracts_list:
-        logger.error("Could not fetch contracts to train. Exiting.")
-        sys.exit(1)
-
-    data_handler = OptionsDataHandler(
-        kite_client=kite_client,
-        contracts=contracts_list,
+    logger.info("--- Starting AI Model Training on Underlying Asset ---")
+    
+    # --- FIX: Train on the underlying symbol, not short-lived options ---
+    data_handler = HistoricalDataHandler(
+        symbols=[Config.UNDERLYING_SYMBOL],
         start_date=BacktestConfig.START_DATE,
         end_date=BacktestConfig.END_DATE,
         timeframe=Config.HISTORICAL_DATA_TIMEFRAME
     )
 
-    all_features, all_labels = [], []
-    
-    for contract in contracts_list:
-        symbol = contract.get('trading_symbol')
-        if not symbol:
-             logger.warning(f"Skipping contract with missing trading symbol: {contract}")
-             continue
-        
-        processed_data = data_handler.data.get(symbol)
-        if processed_data is None or processed_data.empty:
-            logger.warning(f"No data found for {symbol}, skipping training for this contract.")
-            continue
-        
-        logger.info(f"Processing data for {symbol}...")
-        
-        feature_cols_for_training = [col for col in data_handler.scaler.feature_names_in_ if col in processed_data.columns]
-
-        if not feature_cols_for_training:
-             logger.warning(f"No valid features found for {symbol} to train on. Skipping.")
-             continue
-        
-        features = processed_data[feature_cols_for_training]
-        
-        labels = get_target_labels_triple_barrier(processed_data['close'])
-
-        combined = pd.concat([features, labels.rename('target')], axis=1).dropna()
-        features, labels = combined.drop('target', axis=1), combined['target']
-
-        X, y = create_sequences(features, labels, Config.SEQUENCE_LENGTH)
-        
-        if len(X) > 0:
-            all_features.append(X)
-            all_labels.append(y)
-        else:
-            logger.warning(f"Not enough valid sequences generated for {symbol}.")
-
-    if not all_features:
+    if not data_handler.symbol_data:
         logger.error("No data available for training after processing. Exiting.")
         return
 
-    X_all, y_all = np.concatenate(all_features), np.concatenate(all_labels)
-    logger.info(f"Total training sequences created: {len(X_all)}")
+    # All data is now in symbol_data, correctly processed
+    processed_data = data_handler.symbol_data[Config.UNDERLYING_SYMBOL]
+    feature_cols = [col for col in processed_data.columns if col not in ['open', 'high', 'low', 'close', 'volume']]
     
-    if len(X_all) < 2:
-        logger.error("Not enough training samples to perform a train/validation split. Exiting.")
-        return
+    features = processed_data[feature_cols]
+    labels = get_target_labels_triple_barrier(processed_data['close'])
 
-    X_train, X_val, y_train, y_val = train_test_split(X_all, y_all, test_size=0.2, random_state=42, stratify=y_all)
+    X, y = create_sequences(features, labels, Config.SEQUENCE_LENGTH)
+    
+    if len(X) == 0:
+        logger.error("Not enough valid sequences generated. Try a larger date range.")
+        return
+        
+    logger.info(f"Total training sequences created: {len(X)}")
+    
+    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
 
     model = LSTMBrain()
     optimizer = optim.Adam(model.parameters(), lr=0.001)
     criterion = nn.CrossEntropyLoss()
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    X_train_tensor, y_train_tensor = torch.from_numpy(X_train).float().to(device), torch.from_numpy(y_train).long().to(device)
-    X_val_tensor, y_val_tensor = torch.from_numpy(X_val).float().to(device), torch.from_numpy(y_val).long().to(device)
+    X_train_tensor = torch.from_numpy(X_train).float().to(device)
+    y_train_tensor = torch.from_numpy(y_train).long().to(device)
+    X_val_tensor = torch.from_numpy(X_val).float().to(device)
+    y_val_tensor = torch.from_numpy(y_val).long().to(device)
     model.to(device)
 
     epochs, batch_size = 25, 64
